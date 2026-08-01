@@ -42,7 +42,8 @@ addresses are deliberately fixed to `127.0.0.1` and `::1`.
 
 ## Proxy adapter contract
 
-The configured adapter must be installed below `Program Files` and implement:
+The configured adapter must be installed below `Program Files` or `ProgramData`
+and implement:
 
 ```text
 adapter.exe apply  --policy <installed-policy>
@@ -81,7 +82,7 @@ From an elevated PowerShell session:
 
 ```powershell
 $toolDirectory = Join-Path $env:ProgramFiles 'SandboxNetwork'
-$adapterDirectory = Join-Path $env:ProgramFiles 'SandboxProxyAdapter'
+$adapterDirectory = Join-Path $env:ProgramData 'SandboxNetwork'
 New-Item -ItemType Directory -Force -Path $toolDirectory
 New-Item -ItemType Directory -Force -Path $adapterDirectory
 Copy-Item .\out\build\sandbox-network.exe $toolDirectory

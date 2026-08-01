@@ -337,10 +337,15 @@ Result<void> validate_adapter_path(const std::filesystem::path& adapter) {
         protected_location =
             protected_location || path_has_prefix(adapter, *program_files_x86);
     }
+    auto program_data = environment_path(L"ProgramData");
+    if (program_data) {
+        protected_location =
+            protected_location || path_has_prefix(adapter, *program_data);
+    }
     if (!protected_location) {
         return std::unexpected(error(
             ExitCode::usage_or_config, ERROR_ACCESS_DENIED,
-            L"Proxy adapter must be installed below Program Files"));
+            L"Proxy adapter must be installed below Program Files or ProgramData"));
     }
     return {};
 }
@@ -660,6 +665,14 @@ Result<void> set_path_security(
     return {};
 }
 
+Result<void> protect_managed_adapter(const std::filesystem::path& adapter) {
+    if (!path_has_prefix(adapter, installed_policy_path().parent_path())) {
+        return {};
+    }
+    return set_path_security(
+        adapter, L"O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;BU)");
+}
+
 Result<Config> install_config_file(
     const std::filesystem::path& source, bool replace_existing) {
     auto parsed = load_config(source);
@@ -695,6 +708,10 @@ Result<Config> install_config_file(
         L"O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FR;;;BU)");
     if (!protected_directory) {
         return std::unexpected(protected_directory.error());
+    }
+    auto protected_adapter = protect_managed_adapter(parsed->proxy_adapter);
+    if (!protected_adapter) {
+        return std::unexpected(protected_adapter.error());
     }
 
     std::filesystem::path source_full =
@@ -1340,15 +1357,23 @@ Result<void> verify_wfp_policy(const Config& config, PSID sid) {
         return std::unexpected(win32_error(
             ExitCode::verification, code, L"Read expected WFP sublayer"));
     }
+    const bool sublayer_provider_matches =
+        sublayer->providerKey &&
+        IsEqualGUID(*sublayer->providerKey, provider_key);
     const bool sublayer_matches =
         sublayer->flags == FWPM_SUBLAYER_FLAG_PERSISTENT &&
-        sublayer->weight == sublayer_weight && sublayer->providerKey &&
-        IsEqualGUID(*sublayer->providerKey, provider_key);
+        sublayer_provider_matches;
+    const std::wstring sublayer_details =
+        L" (flags=" + std::to_wstring(sublayer->flags) +
+        L", weight=" + std::to_wstring(sublayer->weight) +
+        L", provider=" +
+        (sublayer_provider_matches ? L"expected" : L"different") + L")";
     FwpmFreeMemory0(reinterpret_cast<void**>(&sublayer));
     if (!sublayer_matches) {
         return std::unexpected(error(
             ExitCode::verification, ERROR_INVALID_DATA,
-            L"WFP sublayer does not match the installed policy"));
+            L"WFP sublayer does not match the installed policy" +
+                sublayer_details));
     }
 
     for (const auto& expected : std::array{
@@ -1782,6 +1807,10 @@ Result<void> repair_command(
     auto adapter_valid = validate_adapter_path(config->proxy_adapter);
     if (!adapter_valid) {
         return std::unexpected(adapter_valid.error());
+    }
+    auto protected_adapter = protect_managed_adapter(config->proxy_adapter);
+    if (!protected_adapter) {
+        return std::unexpected(protected_adapter.error());
     }
     auto sid = resolve_account_sid(config->account);
     if (!sid) {
