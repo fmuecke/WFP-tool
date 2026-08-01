@@ -23,6 +23,7 @@ policy_version=7
 proxy_port=8080
 proxy_adapter=C:\Program Files\SandboxProxyAdapter\adapter.exe
 proxy_log=C:\ProgramData\SandboxNetwork\proxy.log
+audit_blocked=true
 
 [allow]
 API.ANTHROPIC.COM=443
@@ -38,6 +39,7 @@ void config_tests() {
     if (parsed) {
         check(parsed->policy_version == 7, "policy version is parsed");
         check(parsed->proxy_port == 8080, "proxy port is parsed");
+        check(parsed->audit_blocked, "blocked-connection auditing is parsed");
         check(parsed->allow.size() == 2, "allowlist is parsed");
         check(
             parsed->approved_probe ==
@@ -80,6 +82,18 @@ void config_tests() {
     check(
         !sandbox_network::parse_config(
              replace(
+                 std::string(valid_config), "audit_blocked=true",
+                 "audit_blocked=yes"))
+             .has_value(),
+        "invalid booleans are rejected");
+    auto default_audit = sandbox_network::parse_config(
+        replace(std::string(valid_config), "audit_blocked=true\n", ""));
+    check(
+        default_audit && !default_audit->audit_blocked,
+        "blocked-connection auditing defaults to false");
+    check(
+        !sandbox_network::parse_config(
+             replace(
                  std::string(valid_config), "approved=api.anthropic.com:443",
                  "approved=denied.example.com:443"))
              .has_value(),
@@ -101,6 +115,11 @@ void cli_tests() {
         sandbox_network::run(unknown) ==
             static_cast<int>(sandbox_network::ExitCode::usage_or_config),
         "unknown command is a usage error");
+    constexpr std::wstring_view invalid_logs[] = {L"logs", L"extra"};
+    check(
+        sandbox_network::run(invalid_logs) ==
+            static_cast<int>(sandbox_network::ExitCode::usage_or_config),
+        "logs rejects extra arguments");
 }
 
 void dummy_proxy_tests() {

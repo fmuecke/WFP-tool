@@ -6,6 +6,7 @@
 #include <aclapi.h>
 #include <fwpmu.h>
 #include <iphlpapi.h>
+#include <ntsecapi.h>
 #include <sddl.h>
 #include <tcpmib.h>
 
@@ -33,6 +34,8 @@ constexpr GUID provider_key{
     0x8809307e, 0xe2b2, 0x4d8b, {0x95, 0x41, 0x47, 0x50, 0x39, 0xb7, 0xf0, 0xdf}};
 constexpr GUID sublayer_key{
     0x22fac16c, 0xe5f1, 0x43d7, {0x8a, 0x67, 0x08, 0x2d, 0x41, 0xce, 0x61, 0x58}};
+constexpr GUID filtering_platform_connection_audit{
+    0x0cce9226, 0x69ae, 0x11d9, {0xbe, 0xd3, 0x50, 0x50, 0x54, 0x50, 0x30, 0x30}};
 constexpr GUID permit_v4_key{
     0xb546bb36, 0x00a3, 0x4c50, {0x90, 0x54, 0x4c, 0x2f, 0xf7, 0xd0, 0x36, 0xfd}};
 constexpr GUID permit_v6_key{
@@ -188,6 +191,18 @@ Result<std::uint32_t> parse_version(std::string_view text) {
             L"policy_version must be a positive integer"));
     }
     return value;
+}
+
+Result<bool> parse_bool(std::string_view text) {
+    if (text == "true") {
+        return true;
+    }
+    if (text == "false") {
+        return false;
+    }
+    return std::unexpected(error(
+        ExitCode::usage_or_config, ERROR_INVALID_DATA,
+        L"Boolean values must be true or false"));
 }
 
 bool is_ip_literal(std::string_view hostname) {
@@ -423,6 +438,93 @@ Result<std::wstring> sid_string(PSID sid) {
     return std::wstring(raw);
 }
 
+Result<void> enable_privilege(const wchar_t* name) {
+    HANDLE raw_token{};
+    if (!OpenProcessToken(
+            GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+            &raw_token)) {
+        const DWORD code = GetLastError();
+        return std::unexpected(win32_error(
+            ExitCode::precondition, code, L"Open process token for audit policy"));
+    }
+    UniqueHandle token(raw_token);
+    TOKEN_PRIVILEGES privileges{};
+    privileges.PrivilegeCount = 1;
+    if (!LookupPrivilegeValueW(nullptr, name, &privileges.Privileges[0].Luid)) {
+        const DWORD code = GetLastError();
+        return std::unexpected(win32_error(
+            ExitCode::precondition, code, L"Resolve audit policy privilege"));
+    }
+    privileges.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+    SetLastError(ERROR_SUCCESS);
+    const BOOL adjusted =
+        AdjustTokenPrivileges(token.get(), FALSE, &privileges, 0, nullptr, nullptr);
+    const DWORD code = GetLastError();
+    if (!adjusted || code != ERROR_SUCCESS) {
+        return std::unexpected(win32_error(
+            ExitCode::precondition, code, L"Enable audit policy privilege"));
+    }
+    return {};
+}
+
+Result<void> configure_block_auditing(bool enabled) {
+    auto privilege = enable_privilege(SE_SECURITY_NAME);
+    if (!privilege) {
+        return std::unexpected(privilege.error());
+    }
+
+    PAUDIT_POLICY_INFORMATION raw{};
+    if (!AuditQuerySystemPolicy(
+            &filtering_platform_connection_audit, 1, &raw)) {
+        const DWORD code = GetLastError();
+        return std::unexpected(win32_error(
+            ExitCode::precondition, code,
+            L"Read blocked-connection audit policy"));
+    }
+    std::unique_ptr<void, decltype(&AuditFree)> existing(raw, AuditFree);
+
+    AUDIT_POLICY_INFORMATION policy{};
+    policy.AuditSubCategoryGuid = filtering_platform_connection_audit;
+    policy.AuditingInformation =
+        raw->AuditingInformation & POLICY_AUDIT_EVENT_SUCCESS;
+    if (enabled) {
+        policy.AuditingInformation |= POLICY_AUDIT_EVENT_FAILURE;
+    } else if (policy.AuditingInformation == 0) {
+        policy.AuditingInformation = POLICY_AUDIT_EVENT_NONE;
+    }
+    if (!AuditSetSystemPolicy(&policy, 1)) {
+        const DWORD code = GetLastError();
+        return std::unexpected(win32_error(
+            ExitCode::precondition, code,
+            L"Set blocked-connection audit policy"));
+    }
+    return {};
+}
+
+Result<void> verify_block_auditing(bool enabled) {
+    auto privilege = enable_privilege(SE_SECURITY_NAME);
+    if (!privilege) {
+        return std::unexpected(privilege.error());
+    }
+    PAUDIT_POLICY_INFORMATION raw{};
+    if (!AuditQuerySystemPolicy(
+            &filtering_platform_connection_audit, 1, &raw)) {
+        const DWORD code = GetLastError();
+        return std::unexpected(win32_error(
+            ExitCode::verification, code,
+            L"Read blocked-connection audit policy"));
+    }
+    std::unique_ptr<void, decltype(&AuditFree)> policy(raw, AuditFree);
+    const bool failure_enabled =
+        (raw->AuditingInformation & POLICY_AUDIT_EVENT_FAILURE) != 0;
+    if (failure_enabled != enabled) {
+        return std::unexpected(error(
+            ExitCode::verification, ERROR_INVALID_DATA,
+            L"Blocked-connection audit policy does not match the configuration"));
+    }
+    return {};
+}
+
 Result<std::vector<std::byte>> security_descriptor(std::wstring_view sddl) {
     PSECURITY_DESCRIPTOR raw{};
     ULONG size{};
@@ -475,6 +577,7 @@ Result<Config> parse_config(std::string_view text) {
     std::optional<std::string> log;
     std::optional<std::uint32_t> version;
     std::optional<std::uint16_t> proxy_port;
+    std::optional<bool> audit_blocked;
     std::optional<Endpoint> approved;
     std::set<Endpoint, bool (*)(const Endpoint&, const Endpoint&)> unique_allow(
         [](const Endpoint& left, const Endpoint& right) {
@@ -545,6 +648,12 @@ Result<Config> parse_config(std::string_view text) {
                 adapter = std::string(value);
             } else if (key == "proxy_log" && !log) {
                 log = std::string(value);
+            } else if (key == "audit_blocked" && !audit_blocked) {
+                auto parsed = parse_bool(value);
+                if (!parsed) {
+                    return std::unexpected(parsed.error());
+                }
+                audit_blocked = *parsed;
             } else {
                 return std::unexpected(error(
                     ExitCode::usage_or_config, ERROR_INVALID_DATA,
@@ -606,6 +715,7 @@ Result<Config> parse_config(std::string_view text) {
     config.proxy_port = *proxy_port;
     config.proxy_adapter = std::move(*wide_adapter);
     config.proxy_log = std::move(*wide_log);
+    config.audit_blocked = audit_blocked.value_or(false);
     config.allow.assign(unique_allow.begin(), unique_allow.end());
     config.approved_probe = std::move(*approved);
     auto valid = validate_config(config);
@@ -1741,6 +1851,10 @@ Result<void> verify_installed() {
     if (!wfp) {
         return std::unexpected(wfp.error());
     }
+    auto audit = verify_block_auditing(config->audit_blocked);
+    if (!audit) {
+        return std::unexpected(audit.error());
+    }
     auto adapter = run_adapter(*config, L"verify");
     if (!adapter) {
         return std::unexpected(adapter.error());
@@ -1784,6 +1898,10 @@ Result<void> install_command(const std::filesystem::path& source) {
     auto probe = verify_approved_connect(*config);
     if (!probe) {
         return std::unexpected(probe.error());
+    }
+    auto audit = configure_block_auditing(config->audit_blocked);
+    if (!audit) {
+        return std::unexpected(audit.error());
     }
     auto written = write_wfp_policy(*config, sid->data(), false);
     if (!written) {
@@ -1836,6 +1954,10 @@ Result<void> repair_command(
     if (!probe) {
         return std::unexpected(probe.error());
     }
+    auto audit = configure_block_auditing(config->audit_blocked);
+    if (!audit) {
+        return std::unexpected(audit.error());
+    }
     auto written = write_wfp_policy(*config, sid->data(), true);
     if (!written) {
         return std::unexpected(written.error());
@@ -1859,6 +1981,10 @@ Result<void> remove_command() {
     auto paths = verify_runtime_paths(*config, sid->data());
     if (!paths) {
         return std::unexpected(paths.error());
+    }
+    auto audit = configure_block_auditing(false);
+    if (!audit) {
+        return std::unexpected(audit.error());
     }
     auto adapter = run_adapter(*config, L"remove");
     if (!adapter) {
@@ -1923,6 +2049,77 @@ Result<void> test_command() {
     return {};
 }
 
+Result<void> logs_command() {
+    auto engine = open_engine(ExitCode::verification);
+    if (!engine) {
+        return std::unexpected(engine.error());
+    }
+    std::array<std::uint64_t, 2> filter_ids{};
+    std::size_t index = 0;
+    for (const GUID* key : {&block_v4_key, &block_v6_key}) {
+        FWPM_FILTER0* raw{};
+        const DWORD code = FwpmFilterGetByKey0(engine->value, key, &raw);
+        if (code != ERROR_SUCCESS) {
+            return std::unexpected(win32_error(
+                ExitCode::verification, code,
+                L"Read sandbox block filter"));
+        }
+        filter_ids[index++] = raw->filterId;
+        FwpmFreeMemory0(reinterpret_cast<void**>(&raw));
+    }
+
+    auto system_root = environment_path(L"SystemRoot");
+    if (!system_root) {
+        return std::unexpected(system_root.error());
+    }
+    const auto executable = *system_root / L"System32" / L"wevtutil.exe";
+    const std::wstring xpath =
+        L"*[System[EventID=5157] and EventData["
+        L"Data[@Name='FilterRTID']='" + std::to_wstring(filter_ids[0]) +
+        L"' or Data[@Name='FilterRTID']='" + std::to_wstring(filter_ids[1]) +
+        L"']]";
+    std::wstring command_line =
+        quote_argument(executable.wstring()) + L" qe Security " +
+        quote_argument(L"/q:" + xpath) + L" /f:text /rd:true /c:100";
+
+    STARTUPINFOW startup{sizeof(startup)};
+    PROCESS_INFORMATION process{};
+    if (!CreateProcessW(
+            executable.c_str(), command_line.data(), nullptr, nullptr, TRUE, 0,
+            nullptr, nullptr, &startup, &process)) {
+        const DWORD code = GetLastError();
+        return std::unexpected(win32_error(
+            ExitCode::verification, code, L"Start Security event query"));
+    }
+    UniqueHandle process_handle(process.hProcess);
+    UniqueHandle thread_handle(process.hThread);
+    const DWORD wait = WaitForSingleObject(process_handle.get(), 30'000);
+    if (wait == WAIT_TIMEOUT) {
+        TerminateProcess(process_handle.get(), ERROR_TIMEOUT);
+        WaitForSingleObject(process_handle.get(), 5'000);
+        return std::unexpected(error(
+            ExitCode::verification, ERROR_TIMEOUT,
+            L"Security event query timed out"));
+    }
+    if (wait != WAIT_OBJECT_0) {
+        const DWORD code = GetLastError();
+        return std::unexpected(win32_error(
+            ExitCode::verification, code, L"Wait for Security event query"));
+    }
+    DWORD exit_code{};
+    if (!GetExitCodeProcess(process_handle.get(), &exit_code)) {
+        const DWORD code = GetLastError();
+        return std::unexpected(win32_error(
+            ExitCode::verification, code, L"Read Security event query result"));
+    }
+    if (exit_code != 0) {
+        return std::unexpected(error(
+            ExitCode::verification, exit_code,
+            L"Security event query failed"));
+    }
+    return {};
+}
+
 void print_usage() {
     std::wcerr
         << L"Usage:\n"
@@ -1930,7 +2127,8 @@ void print_usage() {
         << L"  sandbox-network verify\n"
         << L"  sandbox-network repair [--config <path>]\n"
         << L"  sandbox-network remove\n"
-        << L"  sandbox-network test\n";
+        << L"  sandbox-network test\n"
+        << L"  sandbox-network logs\n";
 }
 
 void write_event(WORD type, std::wstring_view message) {
@@ -2010,6 +2208,14 @@ int run(std::span<const std::wstring_view> arguments) {
         }
         return finish(
             test_command(), L"Sandbox network enforcement tests passed.");
+    }
+    if (command == L"logs") {
+        if (arguments.size() != 1) {
+            print_usage();
+            return static_cast<int>(ExitCode::usage_or_config);
+        }
+        return finish(
+            logs_command(), L"Matching blocked connections listed.");
     }
     print_usage();
     return static_cast<int>(ExitCode::usage_or_config);

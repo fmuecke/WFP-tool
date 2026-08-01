@@ -2,14 +2,16 @@
 
 ## Objective
 
-Restrict all network access originating from a dedicated Windows sandbox account, for example `ClaudeSandbox`, so that:
+Restrict direct TCP- and UDP-based network access originating from a dedicated Windows sandbox account, for example `ClaudeSandbox`, so that:
 
-* every process running as that user is covered
+* attributed TCP and UDP operations from every process running as that user are covered
 * child processes cannot bypass the restriction
-* only explicitly approved internet destinations are reachable
+* only explicitly approved TCP and UDP internet destinations are reachable
 * hostname changes and CDN IP changes do not require firewall rule updates
-* direct TCP, UDP, DNS, QUIC, SMB and other network access is blocked
+* direct TCP, UDP, DNS, QUIC and SMB access is blocked
 * the sandbox fails closed when enforcement is unavailable
+
+ICMP is a known exception; see [Known ICMP limitation](#known-icmp-limitation).
 
 The intended path is:
 
@@ -124,7 +126,7 @@ BLOCK sandbox SID -> all other IPv4 outbound
 BLOCK sandbox SID -> all other IPv6 outbound
 ```
 
-The general block must cover all protocols, not only TCP.
+The general block is not limited by a TCP or UDP protocol condition.
 
 This implicitly blocks:
 
@@ -133,12 +135,23 @@ This implicitly blocks:
 * DNS on port 53
 * DNS-over-TLS on port 853
 * QUIC on UDP 443
-* ICMP
 * SMB
 * direct access to LAN services
 * DNS-over-HTTPS outside the proxy
 
-The Codex implementation currently installs only narrow blocks for ICMP, DNS, DNS-over-TLS and SMB. That model is useful as reference code but is not sufficient for default-deny enforcement.
+### Known ICMP limitation
+
+The account-scoped ALE filters do not reliably block ICMP echo requests on
+Windows 11. In testing, `ping.exe` could send IPv4 echo requests while direct
+TCP and UDP traffic remained blocked. WFP packet layers that can
+unconditionally block ICMP do not expose `FWPM_CONDITION_ALE_USER_ID`, so a
+static filter at those layers would block ICMP for the entire host.
+
+A host-wide ICMP block is not acceptable for this design and is deliberately
+not installed. Complete per-user ICMP enforcement requires a kernel-mode WFP
+callout driver that performs additional attribution, or isolation behind a VM
+or network boundary. Blocking `ping.exe` alone is not enforcement because
+other programs can generate ICMP traffic.
 
 ## Filter ordering
 
@@ -294,7 +307,7 @@ Test:
 * cleared proxy variables
 * local LAN access
 
-All direct paths must fail. Approved proxy traffic must succeed.
+All listed direct TCP and UDP paths must fail. Approved proxy traffic must succeed.
 
 ### Phase 4: Operational integration
 
@@ -325,23 +338,25 @@ Do not initially implement:
 * dynamic traffic learning
 * automatic wildcard generation
 
-These add substantial complexity without being necessary for the initial security objective.
+These add substantial complexity. A kernel-mode callout is required only if
+the security objective expands to reliable per-user ICMP enforcement.
 
 ## Acceptance criteria
 
 The implementation is complete when:
 
-* every process under the sandbox SID is restricted
+* attributed TCP and UDP traffic from every process under the sandbox SID is restricted
 * arbitrary direct TCP and UDP connections fail
 * IPv4 and IPv6 are both covered
 * direct DNS and encrypted DNS bypasses fail
-* only the local proxy is reachable
+* only the local proxy is reachable over TCP and UDP
 * the proxy allows only approved hostnames
 * hostname IP changes require no WFP update
-* proxy failure prevents network access
+* proxy failure prevents TCP- and UDP-based internet access
 * WFP setup failure prevents sandbox startup
 * the sandbox user cannot alter the policy
 * uninstall cleanly removes all owned WFP objects
+* the per-user ICMP limitation is accepted or enforcement is moved to a VM/network boundary
 
 ## Recommended final design
 
@@ -358,5 +373,5 @@ Existing local proxy
     -> resolves changing destination addresses
 
 WFP
-    -> prevents all proxy bypasses
+    -> prevents attributed direct TCP and UDP proxy bypasses
 ```

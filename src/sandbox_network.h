@@ -41,6 +41,7 @@ struct Config {
     std::uint16_t proxy_port;
     std::filesystem::path proxy_adapter;
     std::filesystem::path proxy_log;
+    bool audit_blocked;
     std::vector<Endpoint> allow;
     Endpoint approved_probe;
 };

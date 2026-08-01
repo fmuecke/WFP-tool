@@ -6,6 +6,19 @@ loopback. It is a host-scoped control for network operations attributed to that
 account, not a VM boundary; deployments must separately exclude or test
 brokered paths such as BITS, Docker, WSL and Hyper-V.
 
+## Known limitation: ICMP
+
+The policy does not reliably block ICMP per user. On Windows 11, ICMP echo
+requests made by `ping.exe` can bypass the account-scoped filters even while
+direct TCP and UDP are blocked. WFP layers that can unconditionally block ICMP
+do not provide the user identity needed to limit that block to the sandbox
+account, so this tool deliberately does not install a host-wide ICMP block.
+
+Treat this as enforcement for attributed TCP and UDP traffic, not complete
+per-user network isolation. Strict ICMP isolation requires a kernel-mode WFP
+callout driver or a VM/network boundary. The `test` command does not claim to
+test ICMP enforcement.
+
 ## Build
 
 Requirements: the latest Visual Studio C++ toolchain, Windows SDK, CMake,
@@ -39,6 +52,20 @@ failures, and `6` for verification/test failures.
 Configuration is installed at
 `%ProgramData%\SandboxNetwork\policy.ini`; see `policy.example.ini`. Proxy
 addresses are deliberately fixed to `127.0.0.1` and `::1`.
+
+Set `policy.audit_blocked=true` to enable system-wide failure auditing for
+blocked WFP connections. The default is `false`. Apply a change with
+`repair --config <path>`. This diagnostic setting can produce events for other
+accounts too. Setting it to `false`, or removing the policy, disables failure
+auditing for this system subcategory while preserving success auditing.
+
+Blocked connections are written to the Windows Security log as event 5157.
+From an elevated shell, show the latest 100 events caused specifically by this
+policy's IPv4 and IPv6 block filters with:
+
+```text
+sandbox-network logs
+```
 
 ## Proxy adapter contract
 
@@ -91,6 +118,9 @@ Copy-Item .\out\build\dummy-proxy-adapter.exe $adapterDirectory
 & "$toolDirectory\sandbox-network.exe" install --config .\policy.example.ini
 & "$toolDirectory\sandbox-network.exe" verify
 ```
+
+Keep `sandbox-network.exe` and `dummy-proxy-adapter.exe` from the same build.
+When upgrading a running dummy adapter, stop it before replacing both binaries.
 
 Set `policy.account` to the local test account before installing. Then run the
 installed `sandbox-network.exe test` as that account. It checks the permitted
