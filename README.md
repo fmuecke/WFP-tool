@@ -69,3 +69,37 @@ HTTPS_PROXY=http://127.0.0.1:<proxy-port>
 
 Those variables are cooperative client configuration. The WFP policy is what
 prevents direct socket bypass.
+
+## Dummy adapter for enforcement testing
+
+`dummy-proxy-adapter.exe` is built alongside the policy tool. It is deliberately
+not a forwarding proxy: it binds `127.0.0.1` and `::1`, returns `200` for an
+allowlisted `CONNECT`, returns `403` for everything else, and then closes the
+connection. This is enough to test the WFP permit and default-deny rules.
+
+From an elevated PowerShell session:
+
+```powershell
+$toolDirectory = Join-Path $env:ProgramFiles 'SandboxNetwork'
+$adapterDirectory = Join-Path $env:ProgramFiles 'SandboxProxyAdapter'
+New-Item -ItemType Directory -Force -Path $toolDirectory
+New-Item -ItemType Directory -Force -Path $adapterDirectory
+Copy-Item .\out\build\sandbox-network.exe $toolDirectory
+Copy-Item .\out\build\dummy-proxy-adapter.exe $adapterDirectory
+
+& "$toolDirectory\sandbox-network.exe" install --config .\policy.example.ini
+& "$toolDirectory\sandbox-network.exe" verify
+```
+
+Set `policy.account` to the local test account before installing. Then run the
+installed `sandbox-network.exe test` as that account. It checks the permitted
+proxy path, blocked direct TCP and UDP over IPv4 and IPv6, and repeats the
+bypass checks in a child process.
+
+Remove the test policy from an elevated session:
+
+```powershell
+& "$toolDirectory\sandbox-network.exe" remove
+```
+
+Do not use the dummy adapter for real traffic; it never forwards CONNECT data.

@@ -1,4 +1,5 @@
 #include "sandbox_network.h"
+#include "dummy_proxy.h"
 
 #include <cstdlib>
 #include <iostream>
@@ -102,11 +103,38 @@ void cli_tests() {
         "unknown command is a usage error");
 }
 
+void dummy_proxy_tests() {
+    const sandbox_network::Endpoint allow[] = {
+        {"api.anthropic.com", 443},
+    };
+    check(
+        dummy_proxy::request_allowed(
+            "CONNECT API.ANTHROPIC.COM:443 HTTP/1.1\r\n\r\n", allow),
+        "dummy proxy allows an exact configured CONNECT");
+    check(
+        !dummy_proxy::request_allowed(
+            "CONNECT api.anthropic.com:80 HTTP/1.1\r\n\r\n", allow),
+        "dummy proxy rejects a non-allowlisted port");
+    check(
+        !dummy_proxy::request_allowed(
+            "CONNECT 127.0.0.1:443 HTTP/1.1\r\n\r\n", allow),
+        "dummy proxy rejects IP-literal destinations");
+    check(
+        !dummy_proxy::request_allowed(
+            "CONNECT denied.example:443 HTTP/1.1\r\n\r\n", allow),
+        "dummy proxy rejects a non-allowlisted hostname");
+    check(
+        !dummy_proxy::request_allowed(
+            "GET http://api.anthropic.com/ HTTP/1.1\r\n\r\n", allow),
+        "dummy proxy rejects methods other than CONNECT");
+}
+
 } // namespace
 
 int main() {
     config_tests();
     cli_tests();
+    dummy_proxy_tests();
     if (failures != 0) {
         std::cerr << failures << " test(s) failed\n";
         return EXIT_FAILURE;

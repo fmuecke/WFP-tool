@@ -32,15 +32,31 @@ target_link_libraries(sandbox_network PUBLIC
 add_executable(sandbox-network src/main.cpp)
 target_link_libraries(sandbox-network PRIVATE sandbox_network)
 
+add_library(dummy_proxy STATIC src/dummy_proxy.cpp)
+target_include_directories(dummy_proxy PUBLIC src)
+target_compile_features(dummy_proxy PUBLIC cxx_std_23)
+target_link_libraries(dummy_proxy PUBLIC sandbox_network)
+target_compile_options(dummy_proxy PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/W4 /permissive- /EHsc>
+)
+
+add_executable(dummy-proxy-adapter src/dummy_proxy_main.cpp)
+target_link_libraries(dummy-proxy-adapter PRIVATE dummy_proxy)
+
 include(CTest)
 if(BUILD_TESTING)
     add_executable(sandbox-network-tests tests/tests.cpp)
-    target_link_libraries(sandbox-network-tests PRIVATE sandbox_network)
+    target_link_libraries(sandbox-network-tests PRIVATE sandbox_network dummy_proxy)
     add_test(NAME sandbox-network-tests COMMAND sandbox-network-tests)
 endif()
 
 if(MSVC)
-    set(runtime_targets sandbox_network sandbox-network)
+    set(runtime_targets
+        sandbox_network
+        sandbox-network
+        dummy_proxy
+        dummy-proxy-adapter
+    )
     if(BUILD_TESTING)
         list(APPEND runtime_targets sandbox-network-tests)
     endif()
