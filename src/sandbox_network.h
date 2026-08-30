@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <expected>
 #include <filesystem>
@@ -15,7 +16,7 @@ enum class ExitCode : int {
     usage_or_config = 2,
     precondition = 3,
     wfp = 4,
-    proxy = 5,
+    proxy = 5, // Reserved for compatibility with earlier releases.
     verification = 6,
 };
 
@@ -28,27 +29,21 @@ struct Error {
 template <class T>
 using Result = std::expected<T, Error>;
 
-struct Endpoint {
-    std::string hostname;
-    std::uint16_t port;
-
-    bool operator==(const Endpoint&) const = default;
-};
-
 struct Config {
     std::wstring account;
     std::uint32_t policy_version;
-    std::uint16_t proxy_port;
-    std::filesystem::path proxy_adapter;
-    std::filesystem::path proxy_log;
-    bool audit_blocked;
+    struct Endpoint {
+        bool ipv6;
+        std::array<std::uint8_t, 16> address;
+        std::uint16_t port;
+        bool tcp;
+        bool udp;
+    };
     std::vector<Endpoint> allow;
-    Endpoint approved_probe;
 };
 
 Result<Config> parse_config(std::string_view text);
 Result<Config> load_config(const std::filesystem::path& path);
-std::filesystem::path installed_policy_path();
 int run(std::span<const std::wstring_view> arguments);
 
 } // namespace sandbox_network
