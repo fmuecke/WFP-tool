@@ -1,10 +1,11 @@
 #include "sandbox_network.h"
 
+#include <winsock2.h>
+#include <windows.h>
+#include <fwpmtypes.h>
 #include <fwpmu.h>
 #include <objbase.h>
 #include <sddl.h>
-#include <windows.h>
-#include <winsock2.h>
 #include <ws2tcpip.h>
 
 #include <algorithm>
@@ -302,7 +303,7 @@ Result<void> require_elevation() {
   if (!*elevated) {
     return std::unexpected(
         error(ExitCode::precondition, ERROR_ACCESS_DENIED,
-              L"wfptool must run from an elevated Administrator session"));
+              L"wfp-tool must run from an elevated Administrator session"));
   }
   return {};
 }
@@ -542,7 +543,7 @@ Result<void> enumerate_filters(
   return {};
 }
 
-Result<void> enumerate_wfptool_filters(
+Result<void> enumerate_wfp_tool_filters(
     HANDLE engine,
     const std::function<Result<void>(const FWPM_FILTER0 &)> &visitor) {
   // FwpmFilterCreateEnumHandle0 can report FWP_E_NEVER_MATCH for a
@@ -560,7 +561,7 @@ Result<void> enumerate_wfptool_filters(
 Result<void> enumerate_owned_filters(
     HANDLE engine, const std::vector<UINT8> &identity,
     const std::function<Result<void>(const FWPM_FILTER0 &)> &visitor) {
-  return enumerate_wfptool_filters(
+  return enumerate_wfp_tool_filters(
       engine, [&](const FWPM_FILTER0 &filter) -> Result<void> {
         return is_owned_for(filter, identity) ? visitor(filter)
                                               : Result<void>{};
@@ -579,29 +580,29 @@ Result<void> ensure_infrastructure(HANDLE engine,
     if (!valid) {
       return std::unexpected(
           error(ExitCode::wfp, ERROR_INVALID_DATA,
-                L"Existing WfpTool provider metadata is invalid"));
+                L"Existing wfp-tool provider metadata is invalid"));
     }
   } else if (code == FWP_E_PROVIDER_NOT_FOUND) {
     FWPM_PROVIDER0 provider{};
     provider.providerKey = provider_key;
-    provider.displayData.name = const_cast<wchar_t *>(L"WfpTool Provider");
+    provider.displayData.name = const_cast<wchar_t *>(L"wfp-tool Provider");
     provider.displayData.description = const_cast<wchar_t *>(
         L"Persistent per-user allowlist and default-deny WFP policies");
     provider.flags = FWPM_PROVIDER_FLAG_PERSISTENT;
     code = FwpmProviderAdd0(engine, &provider, object_sd);
     if (code != ERROR_SUCCESS) {
       return std::unexpected(
-          win32_error(ExitCode::wfp, code, L"Add WfpTool provider"));
+          win32_error(ExitCode::wfp, code, L"Add wfp-tool provider"));
     }
   } else {
     return std::unexpected(
-        win32_error(ExitCode::wfp, code, L"Read WfpTool provider"));
+        win32_error(ExitCode::wfp, code, L"Read wfp-tool provider"));
   }
 
   const auto add_sublayer = [&]() -> Result<void> {
     FWPM_SUBLAYER0 sublayer{};
     sublayer.subLayerKey = sublayer_key;
-    sublayer.displayData.name = const_cast<wchar_t *>(L"WfpTool Sublayer");
+    sublayer.displayData.name = const_cast<wchar_t *>(L"wfp-tool Sublayer");
     sublayer.displayData.description = const_cast<wchar_t *>(
         L"Per-user allowlist permits above default-deny blocks");
     sublayer.flags = FWPM_SUBLAYER_FLAG_PERSISTENT;
@@ -610,7 +611,7 @@ Result<void> ensure_infrastructure(HANDLE engine,
     code = FwpmSubLayerAdd0(engine, &sublayer, object_sd);
     if (code != ERROR_SUCCESS) {
       return std::unexpected(
-          win32_error(ExitCode::wfp, code, L"Add WfpTool sublayer"));
+          win32_error(ExitCode::wfp, code, L"Add wfp-tool sublayer"));
     }
     return {};
   };
@@ -623,7 +624,7 @@ Result<void> ensure_infrastructure(HANDLE engine,
     return add_sublayer();
   } else {
     return std::unexpected(
-        win32_error(ExitCode::wfp, code, L"Read WfpTool sublayer"));
+        win32_error(ExitCode::wfp, code, L"Read wfp-tool sublayer"));
   }
   return {};
 }
@@ -633,7 +634,7 @@ Result<void> verify_infrastructure(HANDLE engine) {
   DWORD code = FwpmProviderGetByKey0(engine, &provider_key, &provider);
   if (code != ERROR_SUCCESS) {
     return std::unexpected(
-        win32_error(ExitCode::verification, code, L"Read WfpTool provider"));
+        win32_error(ExitCode::verification, code, L"Read wfp-tool provider"));
   }
   const bool provider_valid =
       (provider->flags & FWPM_PROVIDER_FLAG_PERSISTENT) != 0 &&
@@ -642,14 +643,14 @@ Result<void> verify_infrastructure(HANDLE engine) {
   if (!provider_valid) {
     return std::unexpected(
         error(ExitCode::verification, ERROR_INVALID_DATA,
-              L"Existing WfpTool provider metadata is invalid"));
+              L"Existing wfp-tool provider metadata is invalid"));
   }
 
   FWPM_SUBLAYER0 *sublayer{};
   code = FwpmSubLayerGetByKey0(engine, &sublayer_key, &sublayer);
   if (code != ERROR_SUCCESS) {
     return std::unexpected(
-        win32_error(ExitCode::verification, code, L"Read WfpTool sublayer"));
+        win32_error(ExitCode::verification, code, L"Read wfp-tool sublayer"));
   }
   FwpmFreeMemory0(reinterpret_cast<void **>(&sublayer));
   return {};
@@ -747,9 +748,9 @@ Result<void> add_rule(HANDLE engine, const Rule &rule,
   FWP_BYTE_BLOB provider_data{static_cast<UINT32>(data.size()),
                               const_cast<UINT8 *>(data.data())};
   FWPM_FILTER0 filter{};
-  filter.displayData.name = const_cast<wchar_t *>(L"WfpTool policy rule");
+  filter.displayData.name = const_cast<wchar_t *>(L"wfp-tool policy rule");
   filter.displayData.description = const_cast<wchar_t *>(
-      L"Per-user allowlist or default-deny rule managed by WfpTool");
+      L"Per-user allowlist or default-deny rule managed by wfp-tool");
   filter.flags = FWPM_FILTER_FLAG_PERSISTENT;
   filter.providerKey = const_cast<GUID *>(&provider_key);
   filter.providerData = provider_data;
@@ -762,15 +763,15 @@ Result<void> add_rule(HANDLE engine, const Rule &rule,
   const DWORD code = FwpmFilterAdd0(engine, &filter, object_sd, nullptr);
   if (code != ERROR_SUCCESS) {
     return std::unexpected(
-        win32_error(ExitCode::wfp, code, L"Add WfpTool filter"));
+        win32_error(ExitCode::wfp, code, L"Add wfp-tool filter"));
   }
   return {};
 }
 
-Result<void> delete_wfptool_filters_for_user(HANDLE engine, PSID target_sid) {
+Result<void> delete_wfp_tool_filters_for_user(HANDLE engine, PSID target_sid) {
   std::vector<GUID> keys;
   auto enumerated =
-      enumerate_wfptool_filters(engine, [&](const FWPM_FILTER0 &filter) {
+      enumerate_wfp_tool_filters(engine, [&](const FWPM_FILTER0 &filter) {
         if (IsEqualGUID(filter.subLayerKey, sublayer_key) &&
             filter_mentions_user(filter, target_sid)) {
           keys.push_back(filter.filterKey);
@@ -784,13 +785,13 @@ Result<void> delete_wfptool_filters_for_user(HANDLE engine, PSID target_sid) {
     const DWORD code = FwpmFilterDeleteByKey0(engine, &key);
     if (code != ERROR_SUCCESS) {
       return std::unexpected(
-          win32_error(ExitCode::wfp, code, L"Delete WfpTool filter"));
+          win32_error(ExitCode::wfp, code, L"Delete wfp-tool filter"));
     }
   }
   return {};
 }
 
-Result<void> remove_unused_wfptool_infrastructure(HANDLE engine) {
+Result<void> remove_unused_wfp_tool_infrastructure(HANDLE engine) {
   bool referenced{};
   auto enumerated =
       enumerate_filters(engine, nullptr, [&](const FWPM_FILTER0 &filter) {
@@ -810,22 +811,22 @@ Result<void> remove_unused_wfptool_infrastructure(HANDLE engine) {
   DWORD code = FwpmSubLayerDeleteByKey0(engine, &sublayer_key);
   if (code != ERROR_SUCCESS && code != FWP_E_SUBLAYER_NOT_FOUND) {
     return std::unexpected(
-        win32_error(ExitCode::wfp, code, L"Remove unused WfpTool sublayer"));
+        win32_error(ExitCode::wfp, code, L"Remove unused wfp-tool sublayer"));
   }
   code = FwpmProviderDeleteByKey0(engine, &provider_key);
   if (code != ERROR_SUCCESS && code != FWP_E_PROVIDER_NOT_FOUND) {
     return std::unexpected(
-        win32_error(ExitCode::wfp, code, L"Remove unused WfpTool provider"));
+        win32_error(ExitCode::wfp, code, L"Remove unused wfp-tool provider"));
   }
   return {};
 }
 
 Result<void> clear_user_filters(HANDLE engine, PSID target_sid) {
-  auto removed = delete_wfptool_filters_for_user(engine, target_sid);
+  auto removed = delete_wfp_tool_filters_for_user(engine, target_sid);
   if (!removed) {
     return std::unexpected(removed.error());
   }
-  return remove_unused_wfptool_infrastructure(engine);
+  return remove_unused_wfp_tool_infrastructure(engine);
 }
 
 bool matches_rule(const FWPM_FILTER0 &filter, const Rule &expected,
@@ -917,7 +918,7 @@ Result<void> verify_wfp_policy(const Config &config, PSID sid) {
         }
         return std::unexpected(
             error(ExitCode::verification, ERROR_INVALID_DATA,
-                  L"Installed WfpTool policy contains an unexpected filter"));
+                  L"Installed wfp-tool policy contains an unexpected filter"));
       });
   if (!enumerated) {
     return std::unexpected(enumerated.error());
@@ -926,7 +927,7 @@ Result<void> verify_wfp_policy(const Config &config, PSID sid) {
       std::find(matched.begin(), matched.end(), false) != matched.end()) {
     return std::unexpected(
         error(ExitCode::verification, ERROR_INVALID_DATA,
-              L"Installed WfpTool filters do not match the configuration"));
+              L"Installed wfp-tool filters do not match the configuration"));
   }
   return {};
 }
@@ -947,7 +948,7 @@ Result<void> apply_wfp_policy(const Config &config, PSID sid) {
   const DWORD begin = FwpmTransactionBegin0(engine->value, 0);
   if (begin != ERROR_SUCCESS) {
     return std::unexpected(
-        win32_error(ExitCode::wfp, begin, L"Begin WfpTool transaction"));
+        win32_error(ExitCode::wfp, begin, L"Begin wfp-tool transaction"));
   }
   bool active = true;
   const auto abort = [&] {
@@ -983,7 +984,7 @@ Result<void> apply_wfp_policy(const Config &config, PSID sid) {
   if (commit != ERROR_SUCCESS) {
     abort();
     return std::unexpected(
-        win32_error(ExitCode::wfp, commit, L"Commit WfpTool transaction"));
+        win32_error(ExitCode::wfp, commit, L"Commit wfp-tool transaction"));
   }
   active = false;
   return {};
@@ -1021,7 +1022,7 @@ std::wstring provider_text(const GUID *key) {
   if (!key) {
     return L"<none>";
   }
-  return IsEqualGUID(*key, provider_key) ? L"wfptool" : guid_text(*key);
+  return IsEqualGUID(*key, provider_key) ? L"wfp-tool" : guid_text(*key);
 }
 
 std::wstring protocol_text(const FWPM_FILTER_CONDITION0 *protocol) {
@@ -1089,7 +1090,7 @@ Result<void> clear_user_policy(PSID sid) {
   const DWORD begin = FwpmTransactionBegin0(engine->value, 0);
   if (begin != ERROR_SUCCESS) {
     return std::unexpected(win32_error(ExitCode::wfp, begin,
-                                       L"Begin WfpTool removal transaction"));
+                                       L"Begin wfp-tool removal transaction"));
   }
   auto cleared = clear_user_filters(engine->value, sid);
   if (!cleared) {
@@ -1100,7 +1101,7 @@ Result<void> clear_user_policy(PSID sid) {
   if (commit != ERROR_SUCCESS) {
     FwpmTransactionAbort0(engine->value);
     return std::unexpected(win32_error(ExitCode::wfp, commit,
-                                       L"Commit WfpTool removal transaction"));
+                                       L"Commit wfp-tool removal transaction"));
   }
   return {};
 }
@@ -1147,9 +1148,9 @@ Result<void> list_command(std::wstring_view account) {
   auto enumerated = enumerate_filters(
       engine->value, nullptr, [&](const FWPM_FILTER0 &filter) -> Result<void> {
         const bool matches_account = filter_mentions_user(filter, sid->data());
-        const bool references_wfptool_sublayer =
+        const bool references_wfp_tool_sublayer =
             IsEqualGUID(filter.subLayerKey, sublayer_key);
-        if (!matches_account && !references_wfptool_sublayer) {
+        if (!matches_account && !references_wfp_tool_sublayer) {
           return {};
         }
         ++count;
@@ -1169,7 +1170,7 @@ Result<void> list_command(std::wstring_view account) {
                 ? L"ALE_RESOURCE_ASSIGNMENT_V4"
                 : L"ALE_RESOURCE_ASSIGNMENT_V6";
         std::wcout << L"[" << filter.filterId << L"] "
-                   << (matches_account ? L"account " : L"WfpTool-sublayer ")
+                   << (matches_account ? L"account " : L"wfp-tool-sublayer ")
                    << (filter.action.type == FWP_ACTION_PERMIT ? L"permit "
                                                                : L"block ")
                    << protocol_text(protocol) << L" " << address_text(address);
@@ -1197,11 +1198,11 @@ Result<void> list_command(std::wstring_view account) {
 
 void print_usage() {
   std::wcerr << L"Usage:\n"
-             << L"  wfptool apply --config <path>\n"
-             << L"  wfptool verify --config <path>\n"
-             << L"  wfptool remove --config <path>\n"
-             << L"  wfptool clear --user <account>\n"
-             << L"  wfptool list --user <account>\n";
+             << L"  wfp-tool apply --config <path>\n"
+             << L"  wfp-tool verify --config <path>\n"
+             << L"  wfp-tool remove --config <path>\n"
+             << L"  wfp-tool clear --user <account>\n"
+             << L"  wfp-tool list --user <account>\n";
 }
 
 int finish(Result<void> result, std::wstring_view success_message) {
@@ -1331,27 +1332,27 @@ int run(std::span<const std::wstring_view> arguments) {
     const auto config = std::filesystem::path(arguments[2]);
     if (command == L"apply") {
       return finish(apply_command(config),
-                    L"WfpTool policy applied and verified.");
+                    L"wfp-tool policy applied and verified.");
     }
     if (command == L"verify") {
       return finish(verify_command(config),
-                    L"WfpTool policy matches the configuration.");
+                    L"wfp-tool policy matches the configuration.");
     }
-    return finish(remove_command(config), L"WfpTool policy removed.");
+    return finish(remove_command(config), L"wfp-tool policy removed.");
   }
   if (command == L"list") {
     if (arguments.size() != 3 || arguments[1] != L"--user") {
       print_usage();
       return static_cast<int>(ExitCode::usage_or_config);
     }
-    return finish(list_command(arguments[2]), L"WfpTool filters listed.");
+    return finish(list_command(arguments[2]), L"wfp-tool filters listed.");
   }
   if (command == L"clear") {
     if (arguments.size() != 3 || arguments[1] != L"--user") {
       print_usage();
       return static_cast<int>(ExitCode::usage_or_config);
     }
-    return finish(clear_command(arguments[2]), L"WfpTool filters cleared.");
+    return finish(clear_command(arguments[2]), L"wfp-tool filters cleared.");
   }
   print_usage();
   return static_cast<int>(ExitCode::usage_or_config);

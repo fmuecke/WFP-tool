@@ -1,6 +1,6 @@
 # net-user-filter
 
-`wfptool.exe` is the sole WFP policy manager. It applies an elevated,
+`wfp-tool.exe` is the sole WFP policy manager. It applies an elevated,
 persistent, per-user outbound allowlist: exact TCP/UDP endpoints are permitted
 at a fixed high weight, then lower-weight default-deny filters block every
 other attributed IPv4 and IPv6 TCP/UDP connection.
@@ -33,9 +33,9 @@ proxy_port=8080
 api.anthropic.com=443
 ```
 
-`[wfp-allow]` is wfptool's exact-IP policy: `address:port` for IPv4 and
+`[wfp-allow]` is wfp-tool's exact-IP policy: `address:port` for IPv4 and
 `[address]:port` for IPv6. Values are `tcp`, `udp`, or `tcp,udp`. An IPv4
-permit also covers its IPv4-mapped IPv6 form. wfptool reads `account`,
+permit also covers its IPv4-mapped IPv6 form. wfp-tool reads `account`,
 `policy_version`, and `[wfp-allow]`; it leaves `[allow]` and other GOST or
 orchestration sections alone. At least one WFP endpoint is required.
 
@@ -46,39 +46,39 @@ rules here; it only accepts exact address literals.
 ## Commands
 
 ```text
-wfptool apply --config <path>
-wfptool verify --config <path>
-wfptool remove --config <path>
-wfptool clear --user <account>
-wfptool list --user <account>
+wfp-tool apply --config <path>
+wfp-tool verify --config <path>
+wfp-tool remove --config <path>
+wfp-tool clear --user <account>
+wfp-tool list --user <account>
 ```
 
 All commands require an elevated Administrator session.
 
-- `apply` atomically clears that account's wfptool filters, replaces them with
+- `apply` atomically clears that account's wfp-tool filters, replaces them with
   the complete configuration, then verifies the result.
 - `verify` is read-only and requires the provider, sublayer, and every expected
   filter to match exactly.
-- `remove` removes that account's wfptool filters. It removes the shared
-  provider and sublayer only when no wfptool policy still references them.
+- `remove` removes that account's wfp-tool filters. It removes the shared
+  provider and sublayer only when no wfp-tool policy still references them.
 - `clear` performs the same cleanup without reading a configuration file. It
-  only clears filters owned by wfptool for that SID.
+  only clears filters owned by wfp-tool for that SID.
 - `list` prints every filter that matches the account plus any filter that
-  references wfptool's sublayer, including action, endpoint, layer, provider,
+  references wfp-tool's sublayer, including action, endpoint, layer, provider,
   and filter key. The latter exposes stale references that prevent recovery.
 
 ```powershell
-.\out\build\wfptool.exe apply --config .\policy.example.ini
-.\out\build\wfptool.exe verify --config .\policy.example.ini
-.\out\build\wfptool.exe list --user ClaudeSandbox
+.\out\build\wfp-tool.exe apply --config .\policy.example.ini
+.\out\build\wfp-tool.exe verify --config .\policy.example.ini
+.\out\build\wfp-tool.exe list --user ClaudeSandbox
 ```
 
-wfptool reserves its own provider and sublayer. `apply` clears the selected
-account's wfptool filters before installing the new policy.
+wfp-tool reserves its own provider and sublayer. `apply` clears the selected
+account's wfp-tool filters before installing the new policy.
 
 ## ICMP and limits
 
-wfptool intentionally does not manage ICMP or ICMPv6. Windows does not
+wfp-tool intentionally does not manage ICMP or ICMPv6. Windows does not
 reliably enforce per-user ICMP filters at the available ALE layers; complete
 per-user ICMP enforcement needs a WFP callout driver or a VM/network boundary.
 Transparent redirects, hostname or wildcard WFP filters, and kernel drivers

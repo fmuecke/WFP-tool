@@ -2,7 +2,7 @@
 
 ## Objective
 
-`wfptool.exe` manages persistent Windows Filtering Platform (WFP) filters for
+`wfp-tool.exe` manages persistent Windows Filtering Platform (WFP) filters for
 one Windows account at a time. It implements exact IP-and-port TCP/UDP
 allowlists with a lower-priority, SID-scoped default deny. The policy is a
 complete configuration file, not a sequence of independently weighted rules.
@@ -56,7 +56,7 @@ Duplicate endpoint entries and duplicate protocols are errors. IPv4-mapped
 IPv6 literals are rejected; an IPv4 entry creates the equivalent mapped IPv6
 permit internally.
 
-wfptool consumes `[policy] account`, `[policy] policy_version`, and
+wfp-tool consumes `[policy] account`, `[policy] policy_version`, and
 `[wfp-allow]`. It ignores other sections and keys, allowing GOST and
 orchestration to share the file. `proxy_port` and `[allow]` belong to the GOST
 helper, which performs hostname filtering. WFP rules here deliberately do not
@@ -64,7 +64,7 @@ accept hostnames or wildcard addresses.
 
 ## Filter set
 
-For every configured endpoint and selected protocol wfptool adds a persistent
+For every configured endpoint and selected protocol wfp-tool adds a persistent
 `PERMIT` filter scoped with `FWPM_CONDITION_ALE_USER_ID` at:
 
 * `FWPM_LAYER_ALE_AUTH_CONNECT_V4` for IPv4;
@@ -76,13 +76,13 @@ connections, including direct DNS, DoT, QUIC, SMB, LAN services, and direct
 DoH.
 
 Permits use a fixed high filter weight and default denies a fixed lower weight
-in one persistent wfptool sublayer. The configuration never controls weights.
+in one persistent wfp-tool sublayer. The configuration never controls weights.
 This is necessary because a permit exception and a catch-all block can only
 coexist predictably when their ordering is explicit. Other WFP providers can
 still have blocks that win arbitration, so policy compatibility must be tested
 on the host.
 
-wfptool intentionally does not manage ICMP or ICMPv6. Windows does not
+wfp-tool intentionally does not manage ICMP or ICMPv6. Windows does not
 reliably enforce a per-user ICMP policy at the available ALE layers. Complete
 per-user ICMP enforcement requires a WFP callout driver or a VM/network
 boundary, both of which are out of scope.
@@ -92,15 +92,15 @@ boundary, both of which are out of scope.
 All commands require an elevated Administrator session.
 
 ```text
-wfptool apply --config <path>
-wfptool verify --config <path>
-wfptool remove --config <path>
-wfptool clear --user <account>
-wfptool list --user <account>
+wfp-tool apply --config <path>
+wfp-tool verify --config <path>
+wfp-tool remove --config <path>
+wfp-tool clear --user <account>
+wfp-tool list --user <account>
 ```
 
 `apply` resolves the account SID, transactionally clears that account's
-wfptool filters, creates or validates wfptool's shared provider and sublayer,
+wfp-tool filters, creates or validates wfp-tool's shared provider and sublayer,
 then writes the complete filter set. It verifies the committed policy before
 reporting success.
 
@@ -108,12 +108,12 @@ reporting success.
 requires the owned filters to exactly match every expected filter, including
 their provider data, conditions, actions, layers, and explicit weights.
 
-`remove` transactionally deletes the wfptool filters belonging to the
-configuration's account. It removes the shared wfptool provider and sublayer
-only when no wfptool policy still references them. `clear --user` performs that
+`remove` transactionally deletes the wfp-tool filters belonging to the
+configuration's account. It removes the shared wfp-tool provider and sublayer
+only when no wfp-tool policy still references them. `clear --user` performs that
 same owned-filter cleanup without reading a configuration. `list` accepts an
 account rather than a configuration and displays all filters that match that
-SID, plus all references to wfptool's sublayer so stale fragments are visible.
+SID, plus all references to wfp-tool's sublayer so stale fragments are visible.
 
 ## Proxy integration
 

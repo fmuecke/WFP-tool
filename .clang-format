@@ -1,0 +1,4 @@
+---
+# Windows SDK headers have required dependency order; in particular,
+# fwpmu.h requires windows.h and fwpmtypes.h to have been included first.
+SortIncludes: Never
