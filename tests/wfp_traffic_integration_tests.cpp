@@ -1,8 +1,8 @@
 // Copyright (C) 2026 Florian Mücke
 // SPDX-License-Identifier: GPL-3.0-only
-// Project: https://github.com/fmuecke/WFP-tool.git
+// Project: https://github.com/fmuecke/user-net-lock.git
 
-#include "wfp_tool.h"
+#include "user_net_lock.h"
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -325,13 +325,13 @@ int run_user_port(std::wstring_view command, std::wstring_view user, std::wstrin
     const std::array arguments {
         command, std::wstring_view(L"--user"), user, std::wstring_view(L"--port"), port
     };
-    return wfp_tool::run(arguments);
+    return user_net_lock::run(arguments);
 }
 
 int run_remove(std::wstring_view user)
 {
     const std::array arguments {std::wstring_view(L"remove"), std::wstring_view(L"--user"), user};
-    return wfp_tool::run(arguments);
+    return user_net_lock::run(arguments);
 }
 
 bool set_test_password(std::wstring_view user)
@@ -358,14 +358,14 @@ struct Cleanup
 void traffic_enforcement_tests(std::wstring_view target, std::wstring_view other)
 {
     Cleanup cleanup {target, other};
-    check(run_remove(target) == static_cast<int>(wfp_tool::ExitCode::success),
+    check(run_remove(target) == static_cast<int>(user_net_lock::ExitCode::success),
         "remove any prior target policy");
-    check(run_remove(other) == static_cast<int>(wfp_tool::ExitCode::success),
+    check(run_remove(other) == static_cast<int>(user_net_lock::ExitCode::success),
         "remove any prior control-account policy");
     check(set_test_password(target), "set disposable target-account password");
     check(set_test_password(other), "set disposable control-account password");
     check(run_user_port(L"apply", target, proxy_port) ==
-              static_cast<int>(wfp_tool::ExitCode::success),
+              static_cast<int>(user_net_lock::ExitCode::success),
         "apply target loopback policy");
 
     Winsock winsock;
@@ -500,7 +500,7 @@ int wmain(int argc, wchar_t** argv)
     }
     if (argc != 3)
     {
-        std::wcerr << L"Usage: wfp-tool-traffic-integration-tests <target-account> "
+        std::wcerr << L"Usage: user-net-lock-traffic-integration-tests <target-account> "
                       L"<control-account>\n";
         return EXIT_FAILURE;
     }

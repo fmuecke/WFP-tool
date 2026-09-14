@@ -1,6 +1,6 @@
 # Copyright (C) 2026 Florian Mücke
 # SPDX-License-Identifier: GPL-3.0-only
-# Project: https://github.com/fmuecke/WFP-tool.git
+# Project: https://github.com/fmuecke/user-net-lock.git
 
 # Uses the Windows Sandbox cli to run elevated tests without messing up the dev system.
 #
@@ -33,7 +33,7 @@ function Invoke-WsbRaw {
         throw "wsb $($Arguments -join ' ') failed with exit code $exitCode.`n$output"
     }
     return [PSCustomObject]@{
-        Output = $output
+        Output   = $output
         ExitCode = $exitCode
     }
 }
@@ -67,11 +67,11 @@ if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
 }
 
-$integrationExecutable = Join-Path $repositoryRoot 'out\build\wfp-tool-integration-tests.exe'
+$integrationExecutable = Join-Path $repositoryRoot 'out\build\user-net-lock-integration-tests.exe'
 if (-not (Test-Path -LiteralPath $integrationExecutable -PathType Leaf)) {
     throw "The integration executable was not built: $integrationExecutable"
 }
-$trafficIntegrationExecutable = Join-Path $repositoryRoot 'out\build\wfp-tool-traffic-integration-tests.exe'
+$trafficIntegrationExecutable = Join-Path $repositoryRoot 'out\build\user-net-lock-traffic-integration-tests.exe'
 if (-not (Test-Path -LiteralPath $trafficIntegrationExecutable -PathType Leaf)) {
     throw "The traffic integration executable was not built: $trafficIntegrationExecutable"
 }
@@ -98,7 +98,7 @@ $sandboxId = $null
 # Measure the complete isolated run, including guest startup and teardown, but
 # not the host build performed above.
 $sandboxTiming = [PSCustomObject]@{
-    Stopwatch = [Diagnostics.Stopwatch]::StartNew()
+    Stopwatch   = [Diagnostics.Stopwatch]::StartNew()
     LastSeconds = 0.0
 }
 
@@ -149,7 +149,7 @@ try {
         throw "The sandbox test-account provisioning failed with exit code $($provision.ExitCode).`n$($provision.Output)"
     }
 
-    $testCommand = 'cmd.exe /d /c "wfp-tool-integration-tests.exe {0} {1} > {2}\result.txt 2>&1"' -f $testAccounts[0], $testAccounts[1], $guestDirectory
+    $testCommand = 'cmd.exe /d /c "user-net-lock-integration-tests.exe {0} {1} > {2}\result.txt 2>&1"' -f $testAccounts[0], $testAccounts[1], $guestDirectory
     $execution = Invoke-WsbRaw -Arguments @(
         'exec', '--id', $sandboxId, '-d', $guestDirectory, '-r', 'system', '-c', $testCommand) -CaptureFailure
     Write-SandboxTiming 'Guest integration tests'
@@ -165,7 +165,7 @@ try {
         throw "The sandbox test did not report success.`n$result"
     }
 
-    $trafficCommand = 'cmd.exe /d /c "wfp-tool-traffic-integration-tests.exe {0} {1} > {2}\traffic-result.txt 2>&1"' -f $testAccounts[0], $testAccounts[1], $guestDirectory
+    $trafficCommand = 'cmd.exe /d /c "user-net-lock-traffic-integration-tests.exe {0} {1} > {2}\traffic-result.txt 2>&1"' -f $testAccounts[0], $testAccounts[1], $guestDirectory
     $trafficExecution = Invoke-WsbRaw -Arguments @(
         'exec', '--id', $sandboxId, '-d', $guestDirectory, '-r', 'system', '-c', $trafficCommand) -CaptureFailure
     Write-SandboxTiming 'Guest traffic-enforcement integration test'

@@ -1,6 +1,6 @@
 // Copyright (C) 2026 Florian Mücke
 // SPDX-License-Identifier: GPL-3.0-only
-// Project: https://github.com/fmuecke/WFP-tool.git
+// Project: https://github.com/fmuecke/user-net-lock.git
 
 #pragma once
 
@@ -8,7 +8,7 @@
 #include <span>
 #include <string_view>
 
-namespace wfp_tool
+namespace user_net_lock
 {
 
 enum class ExitCode : int
@@ -22,4 +22,4 @@ enum class ExitCode : int
 
 int run(std::span<const std::wstring_view> arguments);
 
-} // namespace wfp_tool
+} // namespace user_net_lock

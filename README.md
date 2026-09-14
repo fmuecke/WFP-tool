@@ -1,6 +1,6 @@
-# wfp-tool
+# user-net-lock
 
-`wfp-tool.exe` is the small, elevated enforcement primitive for Agent Sandbox.
+`user-net-lock.exe` is the small, elevated enforcement primitive for Agent Sandbox.
 For one Windows account and one loopback proxy port, it creates, verifies, or
 removes a persistent WFP policy:
 
@@ -21,10 +21,10 @@ and healthy.
 All commands require an elevated Administrator session.
 
 ```text
-wfp-tool apply --user <account> --port <port>
-wfp-tool verify --user <account> --port <port>
-wfp-tool remove --user <account>
-wfp-tool list --user <account>
+user-net-lock apply --user <account> --port <port>
+user-net-lock verify --user <account> --port <port>
+user-net-lock remove --user <account>
+user-net-lock list --user <account>
 ```
 
 `apply` replaces only this tool's existing filters for the selected account,
@@ -68,7 +68,7 @@ weakens the provider, sublayer, and filter DACLs, requires `verify` to fail for
 each case, and reapplies to prove DACL repair. Finally, it proves repeated
 apply replaces a user's prior port policy and that removing one user's policy
 leaves the other's intact. The WFP changes and test accounts exist only in the
-Windows Sandbox guest; no host wfp-tool policy is modified.
+Windows Sandbox guest; no host user-net-lock policy is modified.
 
 The same runner also launches a real traffic-enforcement test as the two
 disposable accounts. It proves the target account can use the configured IPv4

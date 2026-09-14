@@ -1,17 +1,17 @@
-# wfp-tool loopback policy
+# user-net-lock loopback policy
 
 ## Contract
 
-For a supplied local account and proxy port, `wfp-tool` owns exactly one
+For a supplied local account and proxy port, `user-net-lock` owns exactly one
 SID-scoped outbound policy. Its permit rules are fixed to loopback TCP on that
 port; its remaining rules block attributed TCP and UDP. The program never
 accepts addresses, protocol choices, hostnames, or policy files.
 
 ```text
-wfp-tool apply  --user AgentSandbox --port 8080
-wfp-tool verify --user AgentSandbox --port 8080
-wfp-tool remove --user AgentSandbox
-wfp-tool list   --user AgentSandbox
+user-net-lock apply  --user AgentSandbox --port 8080
+user-net-lock verify --user AgentSandbox --port 8080
+user-net-lock remove --user AgentSandbox
+user-net-lock list   --user AgentSandbox
 ```
 
 `apply` first validates the shared provider and sublayer, restoring their fixed

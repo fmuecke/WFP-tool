@@ -1,8 +1,8 @@
 ﻿// Copyright (C) 2026 Florian Mücke
 // SPDX-License-Identifier: GPL-3.0-only
-// Project : https: // github.com/fmuecke/WFP-tool.git
+// Project : https: // github.com/fmuecke/user-net-lock.git
 
-#include "wfp_tool.h"
+#include "user_net_lock.h"
 
 #include "wfp_object_access.h"
 
@@ -29,7 +29,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 
-namespace wfp_tool::detail
+namespace user_net_lock::detail
 {
 
 bool same_access_control_descriptor(PSECURITY_DESCRIPTOR actual, PSECURITY_DESCRIPTOR expected)
@@ -151,9 +151,9 @@ bool same_wfp_object_access_control_descriptor(
     return true;
 }
 
-} // namespace wfp_tool::detail
+} // namespace user_net_lock::detail
 
-namespace wfp_tool
+namespace user_net_lock
 {
 namespace
 {
@@ -346,7 +346,7 @@ Result<void> require_elevation()
     {
         return std::unexpected(error(ExitCode::precondition,
             ERROR_ACCESS_DENIED,
-            L"wfp-tool must run from an elevated Administrator session"));
+            L"user-net-lock must run from an elevated Administrator session"));
     }
     return {};
 }
@@ -537,8 +537,8 @@ Result<void> verify_provider_access(HANDLE engine, const std::vector<std::byte>&
         &actual);
     if (code != ERROR_SUCCESS)
     {
-        return std::unexpected(
-            win32_error(ExitCode::verification, code, L"Read wfp-tool provider access control"));
+        return std::unexpected(win32_error(
+            ExitCode::verification, code, L"Read user-net-lock provider access control"));
     }
     const bool matches = detail::same_wfp_object_access_control_descriptor(
         actual, reinterpret_cast<PSECURITY_DESCRIPTOR>(const_cast<std::byte*>(expected.data())));
@@ -548,7 +548,7 @@ Result<void> verify_provider_access(HANDLE engine, const std::vector<std::byte>&
     {
         return std::unexpected(error(ExitCode::verification,
             ERROR_INVALID_DATA,
-            L"wfp-tool provider access control does not match: " + actual_sddl));
+            L"user-net-lock provider access control does not match: " + actual_sddl));
     }
     return {};
 }
@@ -566,8 +566,8 @@ Result<void> verify_sublayer_access(HANDLE engine, const std::vector<std::byte>&
         &actual);
     if (code != ERROR_SUCCESS)
     {
-        return std::unexpected(
-            win32_error(ExitCode::verification, code, L"Read wfp-tool sublayer access control"));
+        return std::unexpected(win32_error(
+            ExitCode::verification, code, L"Read user-net-lock sublayer access control"));
     }
     const bool matches = detail::same_wfp_object_access_control_descriptor(
         actual, reinterpret_cast<PSECURITY_DESCRIPTOR>(const_cast<std::byte*>(expected.data())));
@@ -576,7 +576,7 @@ Result<void> verify_sublayer_access(HANDLE engine, const std::vector<std::byte>&
     {
         return std::unexpected(error(ExitCode::verification,
             ERROR_INVALID_DATA,
-            L"wfp-tool sublayer access control does not match"));
+            L"user-net-lock sublayer access control does not match"));
     }
     return {};
 }
@@ -590,7 +590,7 @@ Result<void> verify_filter_access(
     if (code != ERROR_SUCCESS)
     {
         return std::unexpected(
-            win32_error(ExitCode::verification, code, L"Read wfp-tool filter access control"));
+            win32_error(ExitCode::verification, code, L"Read user-net-lock filter access control"));
     }
     const bool matches = detail::same_wfp_object_access_control_descriptor(
         actual, reinterpret_cast<PSECURITY_DESCRIPTOR>(const_cast<std::byte*>(expected.data())));
@@ -599,7 +599,7 @@ Result<void> verify_filter_access(
     {
         return std::unexpected(error(ExitCode::verification,
             ERROR_INVALID_DATA,
-            L"wfp-tool filter access control does not match"));
+            L"user-net-lock filter access control does not match"));
     }
     return {};
 }
@@ -623,8 +623,9 @@ Error unexpected_sublayer_properties(ExitCode exit_code, const FWPM_SUBLAYER0& s
     const bool minimum_weight = sublayer.weight >= sublayer_weight;
     return error(exit_code,
         ERROR_INVALID_DATA,
-        L"wfp-tool sublayer does not match the policy (persistent=" + std::to_wstring(persistent) +
-            L", expected-provider=" + std::to_wstring(expected_provider) + L", minimum-weight=" +
+        L"user-net-lock sublayer does not match the policy (persistent=" +
+            std::to_wstring(persistent) + L", expected-provider=" +
+            std::to_wstring(expected_provider) + L", minimum-weight=" +
             std::to_wstring(minimum_weight) + L", weight=" + std::to_wstring(sublayer.weight) +
             L")");
 }
@@ -698,21 +699,21 @@ Result<void> ensure_infrastructure(HANDLE engine, const std::vector<std::byte>& 
         {
             return std::unexpected(error(ExitCode::wfp,
                 ERROR_INVALID_DATA,
-                L"Existing wfp-tool provider does not match the policy"));
+                L"Existing user-net-lock provider does not match the policy"));
         }
         code = FwpmProviderSetSecurityInfoByKey0(
             engine, &provider_key, DACL_SECURITY_INFORMATION, nullptr, nullptr, *dacl, nullptr);
         if (code != ERROR_SUCCESS)
         {
             return std::unexpected(
-                win32_error(ExitCode::wfp, code, L"Restore wfp-tool provider access control"));
+                win32_error(ExitCode::wfp, code, L"Restore user-net-lock provider access control"));
         }
     }
     else if (code == FWP_E_PROVIDER_NOT_FOUND)
     {
         FWPM_PROVIDER0 new_provider {};
         new_provider.providerKey = provider_key;
-        new_provider.displayData.name = const_cast<wchar_t*>(L"wfp-tool Provider");
+        new_provider.displayData.name = const_cast<wchar_t*>(L"user-net-lock Provider");
         new_provider.displayData.description =
             const_cast<wchar_t*>(L"Persistent per-user loopback-only filters");
         new_provider.flags = FWPM_PROVIDER_FLAG_PERSISTENT;
@@ -722,12 +723,12 @@ Result<void> ensure_infrastructure(HANDLE engine, const std::vector<std::byte>& 
                 const_cast<std::byte*>(object_descriptor.data())));
         if (code != ERROR_SUCCESS)
         {
-            return std::unexpected(win32_error(ExitCode::wfp, code, L"Add wfp-tool provider"));
+            return std::unexpected(win32_error(ExitCode::wfp, code, L"Add user-net-lock provider"));
         }
     }
     else
     {
-        return std::unexpected(win32_error(ExitCode::wfp, code, L"Read wfp-tool provider"));
+        return std::unexpected(win32_error(ExitCode::wfp, code, L"Read user-net-lock provider"));
     }
 
     FWPM_SUBLAYER0* sublayer {};
@@ -747,18 +748,18 @@ Result<void> ensure_infrastructure(HANDLE engine, const std::vector<std::byte>& 
         if (code != ERROR_SUCCESS)
         {
             return std::unexpected(
-                win32_error(ExitCode::wfp, code, L"Restore wfp-tool sublayer access control"));
+                win32_error(ExitCode::wfp, code, L"Restore user-net-lock sublayer access control"));
         }
         return {};
     }
     if (code != FWP_E_SUBLAYER_NOT_FOUND)
     {
-        return std::unexpected(win32_error(ExitCode::wfp, code, L"Read wfp-tool sublayer"));
+        return std::unexpected(win32_error(ExitCode::wfp, code, L"Read user-net-lock sublayer"));
     }
 
     FWPM_SUBLAYER0 new_sublayer {};
     new_sublayer.subLayerKey = sublayer_key;
-    new_sublayer.displayData.name = const_cast<wchar_t*>(L"wfp-tool Sublayer");
+    new_sublayer.displayData.name = const_cast<wchar_t*>(L"user-net-lock Sublayer");
     new_sublayer.displayData.description =
         const_cast<wchar_t*>(L"Per-user loopback permits above default-deny blocks");
     new_sublayer.flags = FWPM_SUBLAYER_FLAG_PERSISTENT;
@@ -769,7 +770,7 @@ Result<void> ensure_infrastructure(HANDLE engine, const std::vector<std::byte>& 
         reinterpret_cast<PSECURITY_DESCRIPTOR>(const_cast<std::byte*>(object_descriptor.data())));
     if (code != ERROR_SUCCESS)
     {
-        return std::unexpected(win32_error(ExitCode::wfp, code, L"Add wfp-tool sublayer"));
+        return std::unexpected(win32_error(ExitCode::wfp, code, L"Add user-net-lock sublayer"));
     }
     return {};
 }
@@ -866,7 +867,7 @@ Result<void> add_rule(HANDLE engine, const Rule& rule, FWP_BYTE_BLOB& user_descr
     weight.uint64 = const_cast<UINT64*>(&rule.weight);
     FWP_BYTE_BLOB provider_data {static_cast<UINT32>(data.size()), const_cast<UINT8*>(data.data())};
     FWPM_FILTER0 filter {};
-    filter.displayData.name = const_cast<wchar_t*>(L"wfp-tool loopback rule");
+    filter.displayData.name = const_cast<wchar_t*>(L"user-net-lock loopback rule");
     filter.displayData.description =
         const_cast<wchar_t*>(L"Per-user loopback proxy permit or default-deny rule");
     filter.flags = FWPM_FILTER_FLAG_PERSISTENT;
@@ -881,7 +882,7 @@ Result<void> add_rule(HANDLE engine, const Rule& rule, FWP_BYTE_BLOB& user_descr
     const DWORD code = FwpmFilterAdd0(engine, &filter, object_descriptor, nullptr);
     if (code != ERROR_SUCCESS)
     {
-        return std::unexpected(win32_error(ExitCode::wfp, code, L"Add wfp-tool filter"));
+        return std::unexpected(win32_error(ExitCode::wfp, code, L"Add user-net-lock filter"));
     }
     return {};
 }
@@ -907,7 +908,8 @@ Result<void> delete_user_filters(HANDLE engine, const std::vector<UINT8>& identi
         const DWORD code = FwpmFilterDeleteByKey0(engine, &key);
         if (code != ERROR_SUCCESS)
         {
-            return std::unexpected(win32_error(ExitCode::wfp, code, L"Delete wfp-tool filter"));
+            return std::unexpected(
+                win32_error(ExitCode::wfp, code, L"Delete user-net-lock filter"));
         }
     }
     return {};
@@ -935,13 +937,13 @@ Result<void> remove_unused_infrastructure(HANDLE engine)
     if (code != ERROR_SUCCESS && code != FWP_E_SUBLAYER_NOT_FOUND)
     {
         return std::unexpected(
-            win32_error(ExitCode::wfp, code, L"Remove unused wfp-tool sublayer"));
+            win32_error(ExitCode::wfp, code, L"Remove unused user-net-lock sublayer"));
     }
     code = FwpmProviderDeleteByKey0(engine, &provider_key);
     if (code != ERROR_SUCCESS && code != FWP_E_PROVIDER_NOT_FOUND)
     {
         return std::unexpected(
-            win32_error(ExitCode::wfp, code, L"Remove unused wfp-tool provider"));
+            win32_error(ExitCode::wfp, code, L"Remove unused user-net-lock provider"));
     }
     return {};
 }
@@ -957,7 +959,7 @@ Result<void> clear_user_policy(PSID sid)
     if (begin != ERROR_SUCCESS)
     {
         return std::unexpected(
-            win32_error(ExitCode::wfp, begin, L"Begin wfp-tool removal transaction"));
+            win32_error(ExitCode::wfp, begin, L"Begin user-net-lock removal transaction"));
     }
     const auto identity = policy_identity(sid);
     auto deleted = delete_user_filters(engine->value, identity);
@@ -977,7 +979,7 @@ Result<void> clear_user_policy(PSID sid)
     {
         FwpmTransactionAbort0(engine->value);
         return std::unexpected(
-            win32_error(ExitCode::wfp, commit, L"Commit wfp-tool removal transaction"));
+            win32_error(ExitCode::wfp, commit, L"Commit user-net-lock removal transaction"));
     }
     return {};
 }
@@ -1051,7 +1053,7 @@ Result<void> verify_loopback_policy(PSID sid, std::uint16_t port)
     if (provider_result != ERROR_SUCCESS)
     {
         return std::unexpected(
-            win32_error(ExitCode::verification, provider_result, L"Read wfp-tool provider"));
+            win32_error(ExitCode::verification, provider_result, L"Read user-net-lock provider"));
     }
     const bool provider_properties_match = has_expected_provider_properties(*provider);
     FwpmFreeMemory0(reinterpret_cast<void**>(&provider));
@@ -1059,14 +1061,14 @@ Result<void> verify_loopback_policy(PSID sid, std::uint16_t port)
     {
         return std::unexpected(error(ExitCode::verification,
             ERROR_INVALID_DATA,
-            L"wfp-tool provider does not match the policy"));
+            L"user-net-lock provider does not match the policy"));
     }
     FWPM_SUBLAYER0* sublayer {};
     const DWORD sublayer_result = FwpmSubLayerGetByKey0(engine->value, &sublayer_key, &sublayer);
     if (sublayer_result != ERROR_SUCCESS)
     {
         return std::unexpected(
-            win32_error(ExitCode::verification, sublayer_result, L"Read wfp-tool sublayer"));
+            win32_error(ExitCode::verification, sublayer_result, L"Read user-net-lock sublayer"));
     }
     const bool sublayer_properties_match = has_expected_sublayer_properties(*sublayer);
     if (!sublayer_properties_match)
@@ -1168,7 +1170,8 @@ Result<void> apply_loopback_policy(PSID sid, std::uint16_t port)
     const DWORD begin = FwpmTransactionBegin0(engine->value, 0);
     if (begin != ERROR_SUCCESS)
     {
-        return std::unexpected(win32_error(ExitCode::wfp, begin, L"Begin wfp-tool transaction"));
+        return std::unexpected(
+            win32_error(ExitCode::wfp, begin, L"Begin user-net-lock transaction"));
     }
     bool active = true;
     const auto abort = [&]
@@ -1207,7 +1210,8 @@ Result<void> apply_loopback_policy(PSID sid, std::uint16_t port)
     if (commit != ERROR_SUCCESS)
     {
         abort();
-        return std::unexpected(win32_error(ExitCode::wfp, commit, L"Commit wfp-tool transaction"));
+        return std::unexpected(
+            win32_error(ExitCode::wfp, commit, L"Commit user-net-lock transaction"));
     }
     active = false;
     return {};
@@ -1332,7 +1336,7 @@ Result<void> list_command(std::wstring_view user)
         return std::unexpected(engine.error());
     }
     const auto identity = policy_identity(sid->data());
-    std::wcout << L"wfp-tool loopback filters for " << *text << L":\n";
+    std::wcout << L"user-net-lock loopback filters for " << *text << L":\n";
     std::size_t count {};
     auto enumerated = enumerate_filters(engine->value,
         [&](const FWPM_FILTER0& filter) -> Result<void>
@@ -1387,16 +1391,23 @@ Result<UserPort> parse_user_port(std::span<const std::wstring_view> arguments)
 
 void print_usage()
 {
-    std::wcerr << L"WFP-tool - Windows Filtering Platform helper\n"
+    std::wcerr << L"user-net-lock.exe - Bind user traffic to loopback ports.\n"
                << L"Copyright (C) 2026 Florian Mücke\n"
                << L"This is free software - you are welcome to redistribute it under the terms\n"
                << L"of the GNU General Public License version 3; see LICENSE for details.\n"
                //<< L"This program comes with ABSOLUTELY NO WARRANTY.\n"
-               << L"\nUsage:\n"
-               << L"  wfp-tool apply --user <account> --port <port>\n"
-               << L"  wfp-tool verify --user <account> --port <port>\n"
-               << L"  wfp-tool remove --user <account>\n"
-               << L"  wfp-tool list --user <account>\n"
+               << L"\nThe policy permits the selected account's configured loopback\n"
+               << L"TCP port and blocks its other outbound TCP and UDP traffic.\n"
+               << L"\nUsage: user-net-lock.exe <command>\n"
+               << L"\nCommands:\n"
+               << L"  apply  --user <account> --port <port>  Install and verify the policy.\n"
+               << L"  verify --user <account> --port <port>  Check the installed policy.\n"
+               << L"  remove --user <account>                Remove this tool's policy.\n"
+               << L"  list   --user <account>                List this tool's filters.\n"
+               << L"\nOptions:\n"
+               << L"  --user <account>  Local Windows account to which the policy applies.\n"
+               << L"  --port <port>     Loopback TCP port, from 1 through 65535.\n"
+               << L"\nAll commands require an elevated Administrator session.\n"
                << std::endl;
 }
 
@@ -1431,10 +1442,10 @@ int run(std::span<const std::wstring_view> arguments)
         if (arguments[0] == L"apply")
         {
             return finish(apply_command(input->user, input->port),
-                L"wfp-tool loopback policy applied and verified.");
+                L"user-net-lock loopback policy applied and verified.");
         }
         return finish(verify_command(input->user, input->port),
-            L"wfp-tool loopback policy matches the requested user and port.");
+            L"user-net-lock loopback policy matches the requested user and port.");
     }
     if (arguments[0] == L"remove" || arguments[0] == L"list")
     {
@@ -1445,12 +1456,12 @@ int run(std::span<const std::wstring_view> arguments)
         }
         if (arguments[0] == L"remove")
         {
-            return finish(remove_command(arguments[2]), L"wfp-tool loopback policy removed.");
+            return finish(remove_command(arguments[2]), L"user-net-lock loopback policy removed.");
         }
-        return finish(list_command(arguments[2]), L"wfp-tool filters listed.");
+        return finish(list_command(arguments[2]), L"user-net-lock filters listed.");
     }
     print_usage();
     return static_cast<int>(ExitCode::usage);
 }
 
-} // namespace wfp_tool
+} // namespace user_net_lock
