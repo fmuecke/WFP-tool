@@ -1,4 +1,4 @@
-// Copyright (C) 2026 Florian Mücke
+﻿// Copyright (C) 2026 Florian Mücke
 // SPDX-License-Identifier: GPL-3.0-only
 // Project : https: // github.com/fmuecke/WFP-tool.git
 
@@ -1387,11 +1387,16 @@ Result<UserPort> parse_user_port(std::span<const std::wstring_view> arguments)
 
 void print_usage()
 {
-    std::wcerr << L"Usage:\n"
+    std::wcerr << L"WFP-tool - Copyright (C) 2026 Florian Mücke\n"
+               << L"This is free software - you are welcome to redistribute it under the terms\n"
+               << L"of the GNU General Public License version 3; see LICENSE for details.\n"
+               //<< L"This program comes with ABSOLUTELY NO WARRANTY.\n"
+               << L"\nUsage:\n"
                << L"  wfp-tool apply --user <account> --port <port>\n"
                << L"  wfp-tool verify --user <account> --port <port>\n"
                << L"  wfp-tool remove --user <account>\n"
-               << L"  wfp-tool list --user <account>\n";
+               << L"  wfp-tool list --user <account>\n"
+               << std::endl;
 }
 
 int finish(Result<void> result, std::wstring_view success_message)
