@@ -8,14 +8,16 @@
 #include <span>
 #include <string_view>
 
-namespace wfp_tool {
+namespace wfp_tool
+{
 
-enum class ExitCode : int {
-  success = 0,
-  usage = 2,
-  precondition = 3,
-  wfp = 4,
-  verification = 6,
+enum class ExitCode : int
+{
+    success = 0,
+    usage = 2,
+    precondition = 3,
+    wfp = 4,
+    verification = 6,
 };
 
 int run(std::span<const std::wstring_view> arguments);

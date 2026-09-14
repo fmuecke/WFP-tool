@@ -4,379 +4,422 @@
 
 #include "wfp_tool.h"
 
-#include <windows.h>
+#include <array>
+#include <cstdint>
+#include <cstdlib>
 #include <fwpmtypes.h>
 #include <fwpmu.h>
-#include <sddl.h>
-
-#include <array>
-#include <cstdlib>
-#include <cstdint>
 #include <iostream>
 #include <memory>
+#include <sddl.h>
 #include <sstream>
 #include <string_view>
 #include <utility>
 #include <vector>
+#include <windows.h>
 
-namespace {
+namespace
+{
 
-constexpr GUID provider_key{0x9b2365a6,
-                            0xf9b9,
-                            0x49f9,
-                            {0xab, 0xdb, 0x19, 0x65, 0x79, 0xb1, 0x48, 0x1c}};
-constexpr GUID sublayer_key{0x42f667f1,
-                            0x2945,
-                            0x48bd,
-                            {0x81, 0x44, 0x0b, 0xd0, 0x21, 0xe6, 0x74, 0x31}};
+constexpr GUID provider_key {
+    0x9b2365a6, 0xf9b9, 0x49f9, {0xab, 0xdb, 0x19, 0x65, 0x79, 0xb1, 0x48, 0x1c}
+};
+constexpr GUID sublayer_key {
+    0x42f667f1, 0x2945, 0x48bd, {0x81, 0x44, 0x0b, 0xd0, 0x21, 0xe6, 0x74, 0x31}
+};
 // Deliberately weak descriptor used to prove verify rejects a policy object
 // that grants a regular user access.
-constexpr wchar_t weaker_dacl_sddl[] =
-    L"D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GR;;;WD)";
+constexpr wchar_t weaker_dacl_sddl[] = L"D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GR;;;WD)";
 constexpr std::wstring_view first_port = L"49152";
 constexpr std::wstring_view replacement_port = L"49153";
 constexpr std::wstring_view second_port = L"49154";
 
-int failures{};
+int failures {};
 
-void check(bool condition, std::string_view message) {
-  if (!condition) {
-    std::cerr << "FAIL: " << message << '\n';
-    ++failures;
-  }
+void check(bool condition, std::string_view message)
+{
+    if (!condition)
+    {
+        std::cerr << "FAIL: " << message << '\n';
+        ++failures;
+    }
 }
 
-struct Engine {
-  HANDLE value{};
+struct Engine
+{
+    HANDLE value {};
 
-  ~Engine() {
-    if (value) {
-      FwpmEngineClose0(value);
+    ~Engine()
+    {
+        if (value)
+        {
+            FwpmEngineClose0(value);
+        }
     }
-  }
 };
 
-class SecurityDescriptor {
-public:
-  explicit SecurityDescriptor(PCWSTR sddl) {
-    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            sddl, SDDL_REVISION_1, &value_, nullptr)) {
-      check(false, "test security descriptor can be created");
+class SecurityDescriptor
+{
+  public:
+    explicit SecurityDescriptor(PCWSTR sddl)
+    {
+        if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl, SDDL_REVISION_1, &value_, nullptr))
+        {
+            check(false, "test security descriptor can be created");
+        }
     }
-  }
 
-  ~SecurityDescriptor() {
-    if (value_) {
-      LocalFree(value_);
+    ~SecurityDescriptor()
+    {
+        if (value_)
+        {
+            LocalFree(value_);
+        }
     }
-  }
 
-  SecurityDescriptor(const SecurityDescriptor &) = delete;
-  SecurityDescriptor &operator=(const SecurityDescriptor &) = delete;
+    SecurityDescriptor(const SecurityDescriptor&) = delete;
+    SecurityDescriptor& operator=(const SecurityDescriptor&) = delete;
 
-  PACL dacl() const {
-    BOOL present{};
-    BOOL defaulted{};
-    PACL result{};
-    if (!value_ ||
-        !GetSecurityDescriptorDacl(value_, &present, &result, &defaulted) ||
-        !present || !result) {
-      check(false, "test security descriptor has a DACL");
-      return nullptr;
+    PACL dacl() const
+    {
+        BOOL present {};
+        BOOL defaulted {};
+        PACL result {};
+        if (!value_ || !GetSecurityDescriptorDacl(value_, &present, &result, &defaulted) ||
+            !present || !result)
+        {
+            check(false, "test security descriptor has a DACL");
+            return nullptr;
+        }
+        return result;
     }
-    return result;
-  }
 
-private:
-  PSECURITY_DESCRIPTOR value_{};
+  private:
+    PSECURITY_DESCRIPTOR value_ {};
 };
 
-bool is_elevated() {
-  SID_IDENTIFIER_AUTHORITY authority = SECURITY_NT_AUTHORITY;
-  PSID administrators{};
-  if (!AllocateAndInitializeSid(&authority, 2, SECURITY_BUILTIN_DOMAIN_RID,
-                                DOMAIN_ALIAS_RID_ADMINS, 0, 0, 0, 0, 0, 0,
-                                &administrators)) {
-    return false;
-  }
-  BOOL member{};
-  const BOOL checked = CheckTokenMembership(nullptr, administrators, &member);
-  FreeSid(administrators);
-  return checked && member != FALSE;
+bool is_elevated()
+{
+    SID_IDENTIFIER_AUTHORITY authority = SECURITY_NT_AUTHORITY;
+    PSID administrators {};
+    if (!AllocateAndInitializeSid(&authority,
+            2,
+            SECURITY_BUILTIN_DOMAIN_RID,
+            DOMAIN_ALIAS_RID_ADMINS,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            &administrators))
+    {
+        return false;
+    }
+    BOOL member {};
+    const BOOL checked = CheckTokenMembership(nullptr, administrators, &member);
+    FreeSid(administrators);
+    return checked && member != FALSE;
 }
 
-bool open_engine(Engine &engine) {
-  const DWORD code = FwpmEngineOpen0(nullptr, RPC_C_AUTHN_WINNT, nullptr,
-                                     nullptr, &engine.value);
-  check(code == ERROR_SUCCESS, "open WFP engine");
-  return code == ERROR_SUCCESS;
+bool open_engine(Engine& engine)
+{
+    const DWORD code = FwpmEngineOpen0(nullptr, RPC_C_AUTHN_WINNT, nullptr, nullptr, &engine.value);
+    check(code == ERROR_SUCCESS, "open WFP engine");
+    return code == ERROR_SUCCESS;
 }
 
-int run_user_port(std::wstring_view command, std::wstring_view user,
-                  std::wstring_view port) {
-  const std::array arguments{command, std::wstring_view(L"--user"), user,
-                             std::wstring_view(L"--port"), port};
-  return wfp_tool::run(arguments);
+int run_user_port(std::wstring_view command, std::wstring_view user, std::wstring_view port)
+{
+    const std::array arguments {
+        command, std::wstring_view(L"--user"), user, std::wstring_view(L"--port"), port
+    };
+    return wfp_tool::run(arguments);
 }
 
-int run_remove(std::wstring_view user) {
-  const std::array arguments{std::wstring_view(L"remove"),
-                             std::wstring_view(L"--user"), user};
-  return wfp_tool::run(arguments);
+int run_remove(std::wstring_view user)
+{
+    const std::array arguments {std::wstring_view(L"remove"), std::wstring_view(L"--user"), user};
+    return wfp_tool::run(arguments);
 }
 
-class ScopedWcerrCapture {
-public:
-  ScopedWcerrCapture() : original_(std::wcerr.rdbuf(captured_.rdbuf())) {}
+class ScopedWcerrCapture
+{
+  public:
+    ScopedWcerrCapture() : original_(std::wcerr.rdbuf(captured_.rdbuf())) {}
 
-  ~ScopedWcerrCapture() { std::wcerr.rdbuf(original_); }
+    ~ScopedWcerrCapture() { std::wcerr.rdbuf(original_); }
 
-  std::wstring str() const { return captured_.str(); }
+    std::wstring str() const { return captured_.str(); }
 
-  ScopedWcerrCapture(const ScopedWcerrCapture &) = delete;
-  ScopedWcerrCapture &operator=(const ScopedWcerrCapture &) = delete;
+    ScopedWcerrCapture(const ScopedWcerrCapture&) = delete;
+    ScopedWcerrCapture& operator=(const ScopedWcerrCapture&) = delete;
 
-private:
-  std::wostringstream captured_;
-  std::wstreambuf *original_;
+  private:
+    std::wostringstream captured_;
+    std::wstreambuf* original_;
 };
 
-bool expect_verify_failure(std::wstring_view user, std::wstring_view port) {
-  int exit_code{};
-  std::wstring diagnostic;
-  {
-    // A rejection is the expected assertion here. Keep its CLI error output
-    // out of a passing integration-test transcript.
-    ScopedWcerrCapture errors;
-    exit_code = run_user_port(L"verify", user, port);
-    diagnostic = errors.str();
-  }
-  check(exit_code == static_cast<int>(wfp_tool::ExitCode::verification),
+bool expect_verify_failure(std::wstring_view user, std::wstring_view port)
+{
+    int exit_code {};
+    std::wstring diagnostic;
+    {
+        // A rejection is the expected assertion here. Keep its CLI error output
+        // out of a passing integration-test transcript.
+        ScopedWcerrCapture errors;
+        exit_code = run_user_port(L"verify", user, port);
+        diagnostic = errors.str();
+    }
+    check(exit_code == static_cast<int>(wfp_tool::ExitCode::verification),
         "verify rejects the tampered WFP object");
-  if (exit_code != static_cast<int>(wfp_tool::ExitCode::verification)) {
-    std::wcerr << L"Unexpected verify result (" << exit_code << L"): "
-               << diagnostic;
-  }
-  return exit_code == static_cast<int>(wfp_tool::ExitCode::verification);
+    if (exit_code != static_cast<int>(wfp_tool::ExitCode::verification))
+    {
+        std::wcerr << L"Unexpected verify result (" << exit_code << L"): " << diagnostic;
+    }
+    return exit_code == static_cast<int>(wfp_tool::ExitCode::verification);
 }
 
-bool reapply_and_verify(std::wstring_view user, std::wstring_view port) {
-  const int apply = run_user_port(L"apply", user, port);
-  check(apply == static_cast<int>(wfp_tool::ExitCode::success),
+bool reapply_and_verify(std::wstring_view user, std::wstring_view port)
+{
+    const int apply = run_user_port(L"apply", user, port);
+    check(apply == static_cast<int>(wfp_tool::ExitCode::success),
         "apply restores the expected policy");
-  const int verify = run_user_port(L"verify", user, port);
-  check(verify == static_cast<int>(wfp_tool::ExitCode::success),
+    const int verify = run_user_port(L"verify", user, port);
+    check(verify == static_cast<int>(wfp_tool::ExitCode::success),
         "verify accepts the restored policy");
-  return apply == static_cast<int>(wfp_tool::ExitCode::success) &&
-         verify == static_cast<int>(wfp_tool::ExitCode::success);
+    return apply == static_cast<int>(wfp_tool::ExitCode::success) &&
+           verify == static_cast<int>(wfp_tool::ExitCode::success);
 }
 
-std::vector<GUID> filter_keys(HANDLE engine) {
-  std::vector<GUID> keys;
-  HANDLE enumeration{};
-  const DWORD create =
-      FwpmFilterCreateEnumHandle0(engine, nullptr, &enumeration);
-  if (create != ERROR_SUCCESS) {
-    check(false, "create WFP filter enumeration");
+std::vector<GUID> filter_keys(HANDLE engine)
+{
+    std::vector<GUID> keys;
+    HANDLE enumeration {};
+    const DWORD create = FwpmFilterCreateEnumHandle0(engine, nullptr, &enumeration);
+    if (create != ERROR_SUCCESS)
+    {
+        check(false, "create WFP filter enumeration");
+        return keys;
+    }
+    for (;;)
+    {
+        FWPM_FILTER0** filters {};
+        UINT32 count {};
+        const DWORD code = FwpmFilterEnum0(engine, enumeration, 64, &filters, &count);
+        if (code != ERROR_SUCCESS)
+        {
+            check(false, "enumerate WFP filters");
+            break;
+        }
+        for (UINT32 index = 0; index < count; ++index)
+        {
+            if (filters[index]->providerKey &&
+                IsEqualGUID(*filters[index]->providerKey, provider_key))
+            {
+                keys.push_back(filters[index]->filterKey);
+            }
+        }
+        FwpmFreeMemory0(reinterpret_cast<void**>(&filters));
+        if (count == 0)
+        {
+            break;
+        }
+    }
+    FwpmFilterDestroyEnumHandle0(engine, enumeration);
     return keys;
-  }
-  for (;;) {
-    FWPM_FILTER0 **filters{};
-    UINT32 count{};
-    const DWORD code =
-        FwpmFilterEnum0(engine, enumeration, 64, &filters, &count);
-    if (code != ERROR_SUCCESS) {
-      check(false, "enumerate WFP filters");
-      break;
-    }
-    for (UINT32 index = 0; index < count; ++index) {
-      if (filters[index]->providerKey &&
-          IsEqualGUID(*filters[index]->providerKey, provider_key)) {
-        keys.push_back(filters[index]->filterKey);
-      }
-    }
-    FwpmFreeMemory0(reinterpret_cast<void **>(&filters));
-    if (count == 0) {
-      break;
-    }
-  }
-  FwpmFilterDestroyEnumHandle0(engine, enumeration);
-  return keys;
 }
 
-void lifecycle_tests(HANDLE engine, std::wstring_view user) {
-  check(reapply_and_verify(user, first_port),
+void lifecycle_tests(HANDLE engine, std::wstring_view user)
+{
+    check(reapply_and_verify(user, first_port),
         "apply and verify create the disposable-account policy");
-  const auto keys = filter_keys(engine);
-  check(keys.size() == 7, "apply creates exactly seven persistent WFP filters");
-  for (const GUID &key : keys) {
-    FWPM_FILTER0 *filter{};
-    const DWORD filter_result = FwpmFilterGetByKey0(engine, &key, &filter);
-    const bool persistent = filter_result == ERROR_SUCCESS &&
-                            filter->flags == FWPM_FILTER_FLAG_PERSISTENT;
-    if (filter_result == ERROR_SUCCESS) {
-      FwpmFreeMemory0(reinterpret_cast<void **>(&filter));
+    const auto keys = filter_keys(engine);
+    check(keys.size() == 7, "apply creates exactly seven persistent WFP filters");
+    for (const GUID& key : keys)
+    {
+        FWPM_FILTER0* filter {};
+        const DWORD filter_result = FwpmFilterGetByKey0(engine, &key, &filter);
+        const bool persistent =
+            filter_result == ERROR_SUCCESS && filter->flags == FWPM_FILTER_FLAG_PERSISTENT;
+        if (filter_result == ERROR_SUCCESS)
+        {
+            FwpmFreeMemory0(reinterpret_cast<void**>(&filter));
+        }
+        check(persistent, "each wfp-tool filter is persistent");
     }
-    check(persistent, "each wfp-tool filter is persistent");
-  }
 
-  check(run_remove(user) == static_cast<int>(wfp_tool::ExitCode::success),
+    check(run_remove(user) == static_cast<int>(wfp_tool::ExitCode::success),
         "remove deletes the disposable-account policy");
-  check(filter_keys(engine).empty(), "remove leaves no wfp-tool filters");
+    check(filter_keys(engine).empty(), "remove leaves no wfp-tool filters");
 
-  FWPM_PROVIDER0 *provider{};
-  const DWORD provider_result =
-      FwpmProviderGetByKey0(engine, &provider_key, &provider);
-  if (provider_result == ERROR_SUCCESS) {
-    FwpmFreeMemory0(reinterpret_cast<void **>(&provider));
-  }
-  check(provider_result == FWP_E_PROVIDER_NOT_FOUND,
+    FWPM_PROVIDER0* provider {};
+    const DWORD provider_result = FwpmProviderGetByKey0(engine, &provider_key, &provider);
+    if (provider_result == ERROR_SUCCESS)
+    {
+        FwpmFreeMemory0(reinterpret_cast<void**>(&provider));
+    }
+    check(provider_result == FWP_E_PROVIDER_NOT_FOUND,
         "remove deletes the unreferenced wfp-tool provider");
 
-  FWPM_SUBLAYER0 *sublayer{};
-  const DWORD sublayer_result =
-      FwpmSubLayerGetByKey0(engine, &sublayer_key, &sublayer);
-  if (sublayer_result == ERROR_SUCCESS) {
-    FwpmFreeMemory0(reinterpret_cast<void **>(&sublayer));
-  }
-  check(sublayer_result == FWP_E_SUBLAYER_NOT_FOUND,
+    FWPM_SUBLAYER0* sublayer {};
+    const DWORD sublayer_result = FwpmSubLayerGetByKey0(engine, &sublayer_key, &sublayer);
+    if (sublayer_result == ERROR_SUCCESS)
+    {
+        FwpmFreeMemory0(reinterpret_cast<void**>(&sublayer));
+    }
+    check(sublayer_result == FWP_E_SUBLAYER_NOT_FOUND,
         "remove deletes the unreferenced wfp-tool sublayer");
 }
 
-void tamper_provider(HANDLE engine, PACL dacl) {
-  check(FwpmProviderSetSecurityInfoByKey0(
-            engine, &provider_key, DACL_SECURITY_INFORMATION, nullptr, nullptr,
-            dacl, nullptr) == ERROR_SUCCESS,
+void tamper_provider(HANDLE engine, PACL dacl)
+{
+    check(FwpmProviderSetSecurityInfoByKey0(
+              engine, &provider_key, DACL_SECURITY_INFORMATION, nullptr, nullptr, dacl, nullptr) ==
+              ERROR_SUCCESS,
         "tamper provider DACL");
 }
 
-void tamper_sublayer(HANDLE engine, PACL dacl) {
-  check(FwpmSubLayerSetSecurityInfoByKey0(
-            engine, &sublayer_key, DACL_SECURITY_INFORMATION, nullptr, nullptr,
-            dacl, nullptr) == ERROR_SUCCESS,
+void tamper_sublayer(HANDLE engine, PACL dacl)
+{
+    check(FwpmSubLayerSetSecurityInfoByKey0(
+              engine, &sublayer_key, DACL_SECURITY_INFORMATION, nullptr, nullptr, dacl, nullptr) ==
+              ERROR_SUCCESS,
         "tamper sublayer DACL");
 }
 
-bool tamper_filters(HANDLE engine, PACL dacl) {
-  const auto keys = filter_keys(engine);
-  check(keys.size() == 7,
-        "exactly seven WFP filters are present before tampering");
-  if (keys.size() != 7) {
-    return false;
-  }
-  bool succeeded = true;
-  for (const GUID &key : keys) {
-    const bool changed = FwpmFilterSetSecurityInfoByKey0(
-                             engine, &key, DACL_SECURITY_INFORMATION, nullptr,
-                             nullptr, dacl, nullptr) == ERROR_SUCCESS;
-    check(changed, "tamper filter DACL");
-    succeeded = succeeded && changed;
-  }
-  return succeeded;
+bool tamper_filters(HANDLE engine, PACL dacl)
+{
+    const auto keys = filter_keys(engine);
+    check(keys.size() == 7, "exactly seven WFP filters are present before tampering");
+    if (keys.size() != 7)
+    {
+        return false;
+    }
+    bool succeeded = true;
+    for (const GUID& key : keys)
+    {
+        const bool changed =
+            FwpmFilterSetSecurityInfoByKey0(
+                engine, &key, DACL_SECURITY_INFORMATION, nullptr, nullptr, dacl, nullptr) ==
+            ERROR_SUCCESS;
+        check(changed, "tamper filter DACL");
+        succeeded = succeeded && changed;
+    }
+    return succeeded;
 }
 
-struct Cleanup {
-  std::wstring_view first_user;
-  std::wstring_view second_user;
+struct Cleanup
+{
+    std::wstring_view first_user;
+    std::wstring_view second_user;
 
-  ~Cleanup() {
-    run_remove(first_user);
-    run_remove(second_user);
-  }
+    ~Cleanup()
+    {
+        run_remove(first_user);
+        run_remove(second_user);
+    }
 };
 
-void idempotence_and_isolation_tests(std::wstring_view first_user,
-                                     std::wstring_view second_user) {
-  check(reapply_and_verify(first_user, first_port),
-        "apply creates the first account policy");
-  check(reapply_and_verify(first_user, replacement_port),
+void idempotence_and_isolation_tests(std::wstring_view first_user, std::wstring_view second_user)
+{
+    check(reapply_and_verify(first_user, first_port), "apply creates the first account policy");
+    check(reapply_and_verify(first_user, replacement_port),
         "reapplying replaces the first account policy");
-  expect_verify_failure(first_user, first_port);
+    expect_verify_failure(first_user, first_port);
 
-  check(reapply_and_verify(second_user, second_port),
+    check(reapply_and_verify(second_user, second_port),
         "apply creates an independent second account policy");
-  check(run_user_port(L"verify", first_user, replacement_port) ==
-            static_cast<int>(wfp_tool::ExitCode::success),
+    check(run_user_port(L"verify", first_user, replacement_port) ==
+              static_cast<int>(wfp_tool::ExitCode::success),
         "the first account policy remains valid after applying the second");
 
-  check(run_remove(first_user) == static_cast<int>(wfp_tool::ExitCode::success),
+    check(run_remove(first_user) == static_cast<int>(wfp_tool::ExitCode::success),
         "remove deletes only the first account policy");
-  expect_verify_failure(first_user, replacement_port);
-  check(run_user_port(L"verify", second_user, second_port) ==
-            static_cast<int>(wfp_tool::ExitCode::success),
+    expect_verify_failure(first_user, replacement_port);
+    check(run_user_port(L"verify", second_user, second_port) ==
+              static_cast<int>(wfp_tool::ExitCode::success),
         "the second account policy remains valid after removing the first");
 }
 
 } // namespace
 
-int wmain(int argc, wchar_t **argv) {
-  if (argc != 3) {
-    std::wcerr
-        << L"Usage: wfp-tool-integration-tests <first-disposable-account> "
-           L"<second-disposable-account>\n";
-    return EXIT_FAILURE;
-  }
-  if (!is_elevated()) {
-    std::wcerr << L"This integration test requires an elevated Administrator "
-                  L"session.\n";
-    return EXIT_FAILURE;
-  }
+int wmain(int argc, wchar_t** argv)
+{
+    if (argc != 3)
+    {
+        std::wcerr << L"Usage: wfp-tool-integration-tests <first-disposable-account> "
+                      L"<second-disposable-account>\n";
+        return EXIT_FAILURE;
+    }
+    if (!is_elevated())
+    {
+        std::wcerr << L"This integration test requires an elevated Administrator "
+                      L"session.\n";
+        return EXIT_FAILURE;
+    }
 
-  const std::wstring_view first_user(argv[1]);
-  const std::wstring_view second_user(argv[2]);
-  if (first_user == second_user) {
-    std::wcerr << L"The integration test requires two different disposable "
-                  L"accounts.\n";
-    return EXIT_FAILURE;
-  }
-  Cleanup cleanup{first_user, second_user};
-  check(run_remove(first_user) == static_cast<int>(wfp_tool::ExitCode::success),
+    const std::wstring_view first_user(argv[1]);
+    const std::wstring_view second_user(argv[2]);
+    if (first_user == second_user)
+    {
+        std::wcerr << L"The integration test requires two different disposable "
+                      L"accounts.\n";
+        return EXIT_FAILURE;
+    }
+    Cleanup cleanup {first_user, second_user};
+    check(run_remove(first_user) == static_cast<int>(wfp_tool::ExitCode::success),
         "remove any prior first-account policy");
-  check(run_remove(second_user) ==
-            static_cast<int>(wfp_tool::ExitCode::success),
+    check(run_remove(second_user) == static_cast<int>(wfp_tool::ExitCode::success),
         "remove any prior second-account policy");
 
-  Engine engine;
-  if (!open_engine(engine)) {
-    return EXIT_FAILURE;
-  }
-  lifecycle_tests(engine.value, first_user);
-  if (failures != 0 || !reapply_and_verify(first_user, first_port)) {
-    return EXIT_FAILURE;
-  }
-  SecurityDescriptor weaker_dacl(weaker_dacl_sddl);
-  PACL dacl = weaker_dacl.dacl();
-  if (!dacl) {
-    return EXIT_FAILURE;
-  }
+    Engine engine;
+    if (!open_engine(engine))
+    {
+        return EXIT_FAILURE;
+    }
+    lifecycle_tests(engine.value, first_user);
+    if (failures != 0 || !reapply_and_verify(first_user, first_port))
+    {
+        return EXIT_FAILURE;
+    }
+    SecurityDescriptor weaker_dacl(weaker_dacl_sddl);
+    PACL dacl = weaker_dacl.dacl();
+    if (!dacl)
+    {
+        return EXIT_FAILURE;
+    }
 
-  tamper_provider(engine.value, dacl);
-  if (!expect_verify_failure(first_user, first_port) ||
-      !reapply_and_verify(first_user, first_port)) {
-    return EXIT_FAILURE;
-  }
+    tamper_provider(engine.value, dacl);
+    if (!expect_verify_failure(first_user, first_port) ||
+        !reapply_and_verify(first_user, first_port))
+    {
+        return EXIT_FAILURE;
+    }
 
-  tamper_sublayer(engine.value, dacl);
-  if (!expect_verify_failure(first_user, first_port) ||
-      !reapply_and_verify(first_user, first_port)) {
-    return EXIT_FAILURE;
-  }
+    tamper_sublayer(engine.value, dacl);
+    if (!expect_verify_failure(first_user, first_port) ||
+        !reapply_and_verify(first_user, first_port))
+    {
+        return EXIT_FAILURE;
+    }
 
-  if (!tamper_filters(engine.value, dacl) ||
-      !expect_verify_failure(first_user, first_port) ||
-      !reapply_and_verify(first_user, first_port)) {
-    return EXIT_FAILURE;
-  }
+    if (!tamper_filters(engine.value, dacl) || !expect_verify_failure(first_user, first_port) ||
+        !reapply_and_verify(first_user, first_port))
+    {
+        return EXIT_FAILURE;
+    }
 
-  check(run_remove(first_user) == static_cast<int>(wfp_tool::ExitCode::success),
+    check(run_remove(first_user) == static_cast<int>(wfp_tool::ExitCode::success),
         "remove first-account DACL test policy");
-  idempotence_and_isolation_tests(first_user, second_user);
-  check(run_remove(second_user) ==
-            static_cast<int>(wfp_tool::ExitCode::success),
+    idempotence_and_isolation_tests(first_user, second_user);
+    check(run_remove(second_user) == static_cast<int>(wfp_tool::ExitCode::success),
         "remove second-account policy");
-  if (failures != 0) {
-    return EXIT_FAILURE;
-  }
-  std::cout << "WFP integration tests passed\n";
-  return EXIT_SUCCESS;
+    if (failures != 0)
+    {
+        return EXIT_FAILURE;
+    }
+    std::cout << "WFP integration tests passed\n";
+    return EXIT_SUCCESS;
 }

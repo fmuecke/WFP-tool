@@ -6,15 +6,14 @@
 
 #include <windows.h>
 
-namespace wfp_tool::detail {
+namespace wfp_tool::detail
+{
 
 // WFP policy objects are administrative settings. P protects this DACL from
 // inherited engine ACEs, leaving only SYSTEM and Administrators able to alter
 // or delete the provider, sublayer, and filters.
-inline constexpr wchar_t expected_wfp_object_dacl_sddl[] =
-    L"D:P(A;;GA;;;SY)(A;;GA;;;BA)";
+inline constexpr wchar_t expected_wfp_object_dacl_sddl[] = L"D:P(A;;GA;;;SY)(A;;GA;;;BA)";
 
-bool same_access_control_descriptor(PSECURITY_DESCRIPTOR actual,
-                                    PSECURITY_DESCRIPTOR expected);
+bool same_access_control_descriptor(PSECURITY_DESCRIPTOR actual, PSECURITY_DESCRIPTOR expected);
 
 } // namespace wfp_tool::detail
