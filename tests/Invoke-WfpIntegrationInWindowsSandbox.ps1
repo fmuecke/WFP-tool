@@ -71,6 +71,10 @@ $integrationExecutable = Join-Path $repositoryRoot 'out\build\wfp-tool-integrati
 if (-not (Test-Path -LiteralPath $integrationExecutable -PathType Leaf)) {
     throw "The integration executable was not built: $integrationExecutable"
 }
+$trafficIntegrationExecutable = Join-Path $repositoryRoot 'out\build\wfp-tool-traffic-integration-tests.exe'
+if (-not (Test-Path -LiteralPath $trafficIntegrationExecutable -PathType Leaf)) {
+    throw "The traffic integration executable was not built: $trafficIntegrationExecutable"
+}
 
 Write-Host ""
 Write-Host "Starting Windows Sandbox for elevated tests..."
@@ -84,9 +88,11 @@ $runRoot = Join-Path $repositoryRoot 'out\windows-sandbox-integration'
 $runDirectory = Join-Path $runRoot ([Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $runDirectory -Force | Out-Null
 Copy-Item -LiteralPath $integrationExecutable -Destination $runDirectory
+Copy-Item -LiteralPath $trafficIntegrationExecutable -Destination $runDirectory
 $guestDirectory = 'C:\WfpIntegration'
 $testAccounts = @('WfpSandboxTestA', 'WfpSandboxTestB')
 $resultPath = Join-Path $runDirectory 'result.txt'
+$trafficResultPath = Join-Path $runDirectory 'traffic-result.txt'
 
 $sandboxId = $null
 # Measure the complete isolated run, including guest startup and teardown, but
@@ -159,7 +165,24 @@ try {
         throw "The sandbox test did not report success.`n$result"
     }
 
+    $trafficCommand = 'cmd.exe /d /c "wfp-tool-traffic-integration-tests.exe {0} {1} > {2}\traffic-result.txt 2>&1"' -f $testAccounts[0], $testAccounts[1], $guestDirectory
+    $trafficExecution = Invoke-WsbRaw -Arguments @(
+        'exec', '--id', $sandboxId, '-d', $guestDirectory, '-r', 'system', '-c', $trafficCommand) -CaptureFailure
+    Write-SandboxTiming 'Guest traffic-enforcement integration test'
+
+    if (-not (Test-Path -LiteralPath $trafficResultPath -PathType Leaf)) {
+        throw "The sandbox traffic test did not create $trafficResultPath.`n$($trafficExecution.Output)"
+    }
+    $trafficResult = Get-Content -LiteralPath $trafficResultPath -Raw
+    if ($trafficExecution.ExitCode -ne 0) {
+        throw "The sandbox traffic test command failed with exit code $($trafficExecution.ExitCode).`n$trafficResult"
+    }
+    if ($trafficResult -notmatch '(?m)^WFP traffic enforcement integration tests passed\s*$') {
+        throw "The sandbox traffic test did not report success.`n$trafficResult"
+    }
+
     Write-Output $result
+    Write-Output $trafficResult
 }
 finally {
     try {

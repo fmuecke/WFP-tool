@@ -69,3 +69,9 @@ each case, and reapplies to prove DACL repair. Finally, it proves repeated
 apply replaces a user's prior port policy and that removing one user's policy
 leaves the other's intact. The WFP changes and test accounts exist only in the
 Windows Sandbox guest; no host wfp-tool policy is modified.
+
+The same runner also launches a real traffic-enforcement test as the two
+disposable accounts. It proves the target account can use the configured IPv4
+and IPv6 loopback TCP proxy port, cannot use a different loopback port or TCP
+and UDP to a non-loopback address, and that the second account can still reach
+the non-loopback TCP and UDP listeners.

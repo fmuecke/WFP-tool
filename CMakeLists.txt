@@ -43,6 +43,9 @@ if(BUILD_TESTING)
 
     add_executable(wfp-tool-integration-tests tests/wfp_integration_tests.cpp)
     target_link_libraries(wfp-tool-integration-tests PRIVATE wfp_tool_lib)
+
+    add_executable(wfp-tool-traffic-integration-tests tests/wfp_traffic_integration_tests.cpp)
+    target_link_libraries(wfp-tool-traffic-integration-tests PRIVATE wfp_tool_lib iphlpapi netapi32)
     if(DEFINED ENV{WFP_TOOL_INTEGRATION_USER} AND NOT "$ENV{WFP_TOOL_INTEGRATION_USER}" STREQUAL ""
        AND DEFINED ENV{WFP_TOOL_INTEGRATION_OTHER_USER} AND NOT "$ENV{WFP_TOOL_INTEGRATION_OTHER_USER}" STREQUAL "")
         add_test(NAME wfp-tool-integration-tests
@@ -63,6 +66,7 @@ if(MSVC)
     if(BUILD_TESTING)
         list(APPEND runtime_targets wfp-tool-tests)
         list(APPEND runtime_targets wfp-tool-integration-tests)
+        list(APPEND runtime_targets wfp-tool-traffic-integration-tests)
     endif()
     set_property(TARGET ${runtime_targets}
         PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")

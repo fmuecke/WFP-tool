@@ -1387,7 +1387,8 @@ Result<UserPort> parse_user_port(std::span<const std::wstring_view> arguments)
 
 void print_usage()
 {
-    std::wcerr << L"WFP-tool - Copyright (C) 2026 Florian Mücke\n"
+    std::wcerr << L"WFP-tool - Windows Filtering Platform helper\n"
+               << L"Copyright (C) 2026 Florian Mücke\n"
                << L"This is free software - you are welcome to redistribute it under the terms\n"
                << L"of the GNU General Public License version 3; see LICENSE for details.\n"
                //<< L"This program comes with ABSOLUTELY NO WARRANTY.\n"
