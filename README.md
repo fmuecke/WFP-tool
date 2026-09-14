@@ -1,13 +1,45 @@
-# net-user-filter
+# wfp-tool
 
-`wfp-tool.exe` is the sole WFP policy manager. It applies an elevated,
-persistent, per-user outbound allowlist: exact TCP/UDP endpoints are permitted
-at a fixed high weight, then lower-weight default-deny filters block every
-other attributed IPv4 and IPv6 TCP/UDP connection.
+`wfp-tool.exe` is the small, elevated enforcement primitive for Agent Sandbox.
+For one Windows account and one loopback proxy port, it creates, verifies, or
+removes a persistent WFP policy:
 
-This is a host-scoped control for traffic attributed to the account, not a VM
-boundary. Validate brokered paths such as BITS, Docker, WSL, and Hyper-V in the
-deployment that relies on it.
+- permits TCP only to `127.0.0.1:<port>`, `[::1]:<port>`, and the IPv4-mapped
+  IPv6 form of the same loopback endpoint;
+- blocks all other outbound TCP and UDP attributed to that account;
+- leaves ICMP and ICMPv6 unmanaged.
+
+It does not read configuration files, install a proxy, download software,
+resolve hostnames, or interpret an allowlist. It protects its WFP provider,
+sublayer, and filters with the fixed `SYSTEM`/Administrators DACL and verifies
+that DACL. The proxy configurator owns the remaining concerns;
+`agent-win-sandbox` calls this tool only after the loopback proxy is running
+and healthy.
+
+## Commands
+
+All commands require an elevated Administrator session.
+
+```text
+wfp-tool apply --user <account> --port <port>
+wfp-tool verify --user <account> --port <port>
+wfp-tool remove --user <account>
+wfp-tool list --user <account>
+```
+
+`apply` replaces only this tool's existing filters for the selected account,
+installs the fixed loopback policy, and verifies it before reporting success.
+`remove` deletes only this tool's filters for the selected account. `list`
+prints those filters, including any stale loopback policy from a different
+port.
+
+The WFP `ALE_USER_ID` condition necessarily contains a security descriptor for
+the selected account SID; that is the Windows API representation of a
+per-user filter, not a configurable ACL feature.
+
+WFP attribution is host-scoped, not a VM or network boundary. Test WSL,
+containers, virtual machines, BITS, and other brokered paths in the deployment
+that relies on it.
 
 ## Build
 
@@ -15,81 +47,25 @@ deployment that relies on it.
 .\build.ps1
 ```
 
-The script builds Release and runs CTest. Use `-Configuration Debug` for Debug.
+The script builds Release and runs CTest. Use `-Configuration Debug` for a
+Debug build.
 
-## Policy
+### Elevated integration test in Windows Sandbox
 
-```ini
-[policy]
-account=ClaudeSandbox
-policy_version=1
-proxy_port=8080
-
-[wfp-allow]
-127.0.0.1:8080=tcp
-[::1]:8080=tcp
-
-[allow]
-api.anthropic.com=443
-```
-
-`[wfp-allow]` is wfp-tool's exact-IP policy: `address:port` for IPv4 and
-`[address]:port` for IPv6. Values are `tcp`, `udp`, or `tcp,udp`. An IPv4
-permit also covers its IPv4-mapped IPv6 form. wfp-tool reads `account`,
-`policy_version`, and `[wfp-allow]`; it leaves `[allow]` and other GOST or
-orchestration sections alone. At least one WFP endpoint is required.
-
-`proxy_port` and `[allow]` remain for `setup-gost.ps1`, which generates GOST's
-hostname allowlist. WFP itself cannot safely implement hostname or wildcard
-rules here; it only accepts exact address literals.
-
-## Commands
-
-```text
-wfp-tool apply --config <path>
-wfp-tool verify --config <path>
-wfp-tool remove --config <path>
-wfp-tool clear --user <account>
-wfp-tool list --user <account>
-```
-
-All commands require an elevated Administrator session.
-
-- `apply` atomically clears that account's wfp-tool filters, replaces them with
-  the complete configuration, then verifies the result.
-- `verify` is read-only and requires the provider, sublayer, and every expected
-  filter to match exactly.
-- `remove` removes that account's wfp-tool filters. It removes the shared
-  provider and sublayer only when no wfp-tool policy still references them.
-- `clear` performs the same cleanup without reading a configuration file. It
-  only clears filters owned by wfp-tool for that SID.
-- `list` prints every filter that matches the account plus any filter that
-  references wfp-tool's sublayer, including action, endpoint, layer, provider,
-  and filter key. The latter exposes stale references that prevent recovery.
+The default test run is non-mutating. To exercise real WFP DACL tampering,
+use the Windows Sandbox CLI runner. It refuses to attach to an existing
+sandbox, starts a fresh unconfigured guest, shares one writable directory,
+copies the test executable there, runs it as `SYSTEM`, validates `result.txt`,
+and stops the guest:
 
 ```powershell
-.\out\build\wfp-tool.exe apply --config .\policy.example.ini
-.\out\build\wfp-tool.exe verify --config .\policy.example.ini
-.\out\build\wfp-tool.exe list --user ClaudeSandbox
+.\tests\Invoke-WfpIntegrationInWindowsSandbox.ps1
 ```
 
-wfp-tool reserves its own provider and sublayer. `apply` clears the selected
-account's wfp-tool filters before installing the new policy.
-
-## ICMP and limits
-
-wfp-tool intentionally does not manage ICMP or ICMPv6. Windows does not
-reliably enforce per-user ICMP filters at the available ALE layers; complete
-per-user ICMP enforcement needs a WFP callout driver or a VM/network boundary.
-Transparent redirects, hostname or wildcard WFP filters, and kernel drivers
-are out of scope.
-
-## GOST helper
-
-`setup-gost.ps1` generates `%ProgramData%\SandboxNetwork\gost\gost.yml` from
-`proxy_port` and `[allow]`, with loopback listeners and a hostname-and-port
-allowlist. It validates the generated configuration but does not install or
-start a service. Run GOST under an identity other than the sandbox account.
-
-GOST's bypass ACL does not distinguish `CONNECT` from ordinary HTTP: allowing
-`hostname:80` also permits `CONNECT` to that destination.
+The test applies and verifies the policy, confirms exactly seven filters, then
+removes it and confirms its filters, provider, and sublayer are gone. It also
+weakens the provider, sublayer, and filter DACLs, requires `verify` to fail for
+each case, and reapplies to prove DACL repair. Finally, it proves repeated
+apply replaces a user's prior port policy and that removing one user's policy
+leaves the other's intact. The WFP changes and test accounts exist only in the
+Windows Sandbox guest; no host wfp-tool policy is modified.

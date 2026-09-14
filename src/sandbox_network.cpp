@@ -1,3 +1,7 @@
+// Copyright (C) 2026 Florian Mücke
+// SPDX-License-Identifier: GPL-3.0-only
+// Project : https: // github.com/fmuecke/WFP-tool.git
+
 #include "sandbox_network.h"
 
 #include <winsock2.h>
@@ -8,20 +12,131 @@
 #include <sddl.h>
 #include <ws2tcpip.h>
 
+#include "wfp_object_access.h"
+
 #include <algorithm>
 #include <array>
-#include <cctype>
-#include <charconv>
+#include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <cwctype>
-#include <fstream>
+#include <expected>
 #include <functional>
 #include <iostream>
 #include <memory>
 #include <optional>
-#include <sstream>
-#include <system_error>
+#include <string>
 #include <utility>
+#include <vector>
+
+namespace sandbox_network::detail {
+
+bool same_access_control_descriptor(PSECURITY_DESCRIPTOR actual,
+                                    PSECURITY_DESCRIPTOR expected) {
+  if (!actual || !expected || !IsValidSecurityDescriptor(actual) ||
+      !IsValidSecurityDescriptor(expected)) {
+    return false;
+  }
+  BOOL actual_present{};
+  BOOL actual_defaulted{};
+  PACL actual_dacl{};
+  BOOL expected_present{};
+  BOOL expected_defaulted{};
+  PACL expected_dacl{};
+  if (!GetSecurityDescriptorDacl(actual, &actual_present, &actual_dacl,
+                                 &actual_defaulted) ||
+      !GetSecurityDescriptorDacl(expected, &expected_present, &expected_dacl,
+                                 &expected_defaulted) ||
+      actual_present != expected_present ||
+      actual_defaulted != expected_defaulted || !actual_dacl ||
+      !expected_dacl) {
+    return false;
+  }
+  return actual_dacl->AclSize == expected_dacl->AclSize &&
+         std::memcmp(actual_dacl, expected_dacl, actual_dacl->AclSize) == 0;
+}
+
+bool same_wfp_object_access_control_descriptor(PSECURITY_DESCRIPTOR actual,
+                                               PSECURITY_DESCRIPTOR expected) {
+  if (!actual || !expected || !IsValidSecurityDescriptor(actual) ||
+      !IsValidSecurityDescriptor(expected)) {
+    return false;
+  }
+  BOOL actual_present{};
+  BOOL actual_defaulted{};
+  PACL actual_dacl{};
+  BOOL expected_present{};
+  BOOL expected_defaulted{};
+  PACL expected_dacl{};
+  if (!GetSecurityDescriptorDacl(actual, &actual_present, &actual_dacl,
+                                 &actual_defaulted) ||
+      !GetSecurityDescriptorDacl(expected, &expected_present, &expected_dacl,
+                                 &expected_defaulted) ||
+      !actual_present || !expected_present || !actual_dacl || !expected_dacl) {
+    return false;
+  }
+
+  std::vector<const ACCESS_ALLOWED_ACE *> expected_aces;
+  for (DWORD index = 0; index < expected_dacl->AceCount; ++index) {
+    void *entry{};
+    if (!GetAce(expected_dacl, index, &entry)) {
+      return false;
+    }
+    const auto *header = static_cast<const ACE_HEADER *>(entry);
+    if (header->AceType != ACCESS_ALLOWED_ACE_TYPE ||
+        (header->AceFlags & INHERITED_ACE) != 0) {
+      return false;
+    }
+    expected_aces.push_back(static_cast<const ACCESS_ALLOWED_ACE *>(entry));
+  }
+
+  std::vector<const ACCESS_ALLOWED_ACE *> actual_aces;
+  for (DWORD index = 0; index < actual_dacl->AceCount; ++index) {
+    void *entry{};
+    if (!GetAce(actual_dacl, index, &entry)) {
+      return false;
+    }
+    const auto *header = static_cast<const ACE_HEADER *>(entry);
+    if ((header->AceFlags & INHERITED_ACE) != 0) {
+      continue;
+    }
+    if (header->AceType != ACCESS_ALLOWED_ACE_TYPE) {
+      return false;
+    }
+    actual_aces.push_back(static_cast<const ACCESS_ALLOWED_ACE *>(entry));
+  }
+  if (actual_aces.size() != expected_aces.size()) {
+    return false;
+  }
+
+  std::vector<bool> matched(actual_aces.size());
+  for (const ACCESS_ALLOWED_ACE *expected_ace : expected_aces) {
+    const PSID expected_sid =
+        const_cast<PSID>(static_cast<const void *>(&expected_ace->SidStart));
+    DWORD expected_mask = expected_ace->Mask;
+    if ((expected_mask & GENERIC_ALL) != 0) {
+      expected_mask = (expected_mask & ~GENERIC_ALL) | FWPM_GENERIC_ALL;
+    }
+    bool found{};
+    for (std::size_t index = 0; index < actual_aces.size(); ++index) {
+      const ACCESS_ALLOWED_ACE *actual_ace = actual_aces[index];
+      const PSID actual_sid =
+          const_cast<PSID>(static_cast<const void *>(&actual_ace->SidStart));
+      if (!matched[index] && actual_ace->Mask == expected_mask &&
+          EqualSid(actual_sid, expected_sid)) {
+        matched[index] = true;
+        found = true;
+        break;
+      }
+    }
+    if (!found) {
+      return false;
+    }
+  }
+  return true;
+}
+
+} // namespace sandbox_network::detail
 
 namespace sandbox_network {
 namespace {
@@ -34,25 +149,39 @@ constexpr GUID sublayer_key{0x42f667f1,
                             0x2945,
                             0x48bd,
                             {0x81, 0x44, 0x0b, 0xd0, 0x21, 0xe6, 0x74, 0x31}};
-
 constexpr std::uint64_t permit_weight = 0xF000000000000000ULL;
 constexpr std::uint64_t block_weight = 0x1000000000000000ULL;
 constexpr std::uint16_t sublayer_weight = 0x8000;
-constexpr std::array<UINT8, 8> policy_tag_prefix{'w', 'f', 'p', 't',
-                                                 'o', 'o', 'l', '1'};
+constexpr std::array<UINT8, 16> loopback_v6{0, 0, 0, 0, 0, 0, 0, 0,
+                                            0, 0, 0, 0, 0, 0, 0, 1};
+constexpr std::array<UINT8, 16> mapped_loopback_v6{
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 127, 0, 0, 1};
+constexpr std::array<UINT8, 16> policy_tag{'w', 'f', 'p', '-', 'l', 'o',
+                                           'o', 'p', 'b', 'a', 'c', 'k',
+                                           '-', 'v', '1', 0};
 
 using LocalMemory = std::unique_ptr<void, decltype(&LocalFree)>;
 
+struct Error {
+  ExitCode exit_code;
+  std::uint32_t native_code;
+  std::wstring message;
+};
+
+template <typename T> using Result = std::expected<T, Error>;
+
 struct Engine {
   HANDLE value{};
+
   ~Engine() {
     if (value) {
       FwpmEngineClose0(value);
     }
   }
+
+  Engine() = default;
   Engine(const Engine &) = delete;
   Engine &operator=(const Engine &) = delete;
-  Engine() = default;
   Engine(Engine &&other) noexcept
       : value(std::exchange(other.value, nullptr)) {}
   Engine &operator=(Engine &&other) noexcept {
@@ -70,10 +199,15 @@ struct Rule {
   const GUID *layer;
   FWP_ACTION_TYPE action;
   std::uint64_t weight;
-  std::optional<std::uint8_t> protocol;
+  std::uint8_t protocol;
   std::optional<std::uint32_t> address_v4;
   std::optional<std::array<UINT8, 16>> address_v6;
   std::optional<std::uint16_t> port;
+};
+
+struct UserPort {
+  std::wstring user;
+  std::uint16_t port;
 };
 
 Error error(ExitCode exit_code, std::uint32_t native_code,
@@ -104,174 +238,32 @@ Error win32_error(ExitCode exit_code, DWORD code, std::wstring_view operation) {
                    std::to_wstring(code) + L")");
 }
 
-std::string_view trim(std::string_view text) {
-  while (!text.empty() &&
-         std::isspace(static_cast<unsigned char>(text.front()))) {
-    text.remove_prefix(1);
-  }
-  while (!text.empty() &&
-         std::isspace(static_cast<unsigned char>(text.back()))) {
-    text.remove_suffix(1);
-  }
-  return text;
-}
-
-std::string ascii_lower(std::string_view text) {
-  std::string result(text);
-  for (char &c : result) {
-    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-  }
-  return result;
-}
-
-Result<std::wstring> utf8_to_wide(std::string_view text) {
+Result<std::uint16_t> parse_port(std::wstring_view text) {
   if (text.empty()) {
-    return std::wstring{};
-  }
-  const int length =
-      MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text.data(),
-                          static_cast<int>(text.size()), nullptr, 0);
-  if (!length) {
-    return std::unexpected(win32_error(ExitCode::usage_or_config,
-                                       GetLastError(), L"Decode UTF-8"));
-  }
-  std::wstring result(static_cast<std::size_t>(length), L'\0');
-  if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text.data(),
-                           static_cast<int>(text.size()), result.data(),
-                           length)) {
-    return std::unexpected(win32_error(ExitCode::usage_or_config,
-                                       GetLastError(), L"Decode UTF-8"));
-  }
-  return result;
-}
-
-Result<std::uint16_t> parse_port(std::string_view text) {
-  unsigned value{};
-  const auto [end, status] =
-      std::from_chars(text.data(), text.data() + text.size(), value);
-  if (status != std::errc{} || end != text.data() + text.size() || value == 0 ||
-      value > 65535) {
     return std::unexpected(
-        error(ExitCode::usage_or_config, ERROR_INVALID_DATA,
-              L"Ports must be decimal values between 1 and 65535"));
+        error(ExitCode::usage, ERROR_INVALID_DATA,
+              L"Port must be a decimal value between 1 and 65535"));
+  }
+  std::uint32_t value{};
+  for (const wchar_t character : text) {
+    if (!std::iswdigit(character)) {
+      return std::unexpected(
+          error(ExitCode::usage, ERROR_INVALID_DATA,
+                L"Port must be a decimal value between 1 and 65535"));
+    }
+    value = value * 10 + static_cast<std::uint32_t>(character - L'0');
+    if (value > 65535) {
+      return std::unexpected(
+          error(ExitCode::usage, ERROR_INVALID_DATA,
+                L"Port must be a decimal value between 1 and 65535"));
+    }
+  }
+  if (value == 0) {
+    return std::unexpected(
+        error(ExitCode::usage, ERROR_INVALID_DATA,
+              L"Port must be a decimal value between 1 and 65535"));
   }
   return static_cast<std::uint16_t>(value);
-}
-
-Result<std::uint32_t> parse_version(std::string_view text) {
-  std::uint32_t value{};
-  const auto [end, status] =
-      std::from_chars(text.data(), text.data() + text.size(), value);
-  if (status != std::errc{} || end != text.data() + text.size() || value == 0) {
-    return std::unexpected(
-        error(ExitCode::usage_or_config, ERROR_INVALID_DATA,
-              L"policy_version must be a non-zero unsigned integer"));
-  }
-  return value;
-}
-
-bool is_v4_mapped(const std::array<UINT8, 16> &address) {
-  return std::all_of(address.begin(), address.begin() + 10,
-                     [](UINT8 value) { return value == 0; }) &&
-         address[10] == 0xff && address[11] == 0xff;
-}
-
-Result<Config::Endpoint> parse_endpoint(std::string_view endpoint_text,
-                                        std::string_view protocols_text) {
-  Config::Endpoint endpoint{};
-  endpoint_text = trim(endpoint_text);
-  const std::string protocols = ascii_lower(trim(protocols_text));
-  std::size_t protocol_start = 0;
-  while (protocol_start <= protocols.size()) {
-    const std::size_t comma = protocols.find(',', protocol_start);
-    const std::string_view protocol = trim(std::string_view(protocols).substr(
-        protocol_start, comma == std::string::npos ? std::string::npos
-                                                   : comma - protocol_start));
-    if (protocol == "tcp" && !endpoint.tcp) {
-      endpoint.tcp = true;
-    } else if (protocol == "udp" && !endpoint.udp) {
-      endpoint.udp = true;
-    } else {
-      return std::unexpected(error(ExitCode::usage_or_config,
-                                   ERROR_INVALID_DATA,
-                                   L"[wfp-allow] values must be tcp, udp, or "
-                                   L"tcp,udp without duplicates"));
-    }
-    if (comma == std::string::npos) {
-      break;
-    }
-    protocol_start = comma + 1;
-  }
-  if (!endpoint.tcp && !endpoint.udp) {
-    return std::unexpected(error(ExitCode::usage_or_config, ERROR_INVALID_DATA,
-                                 L"[wfp-allow] must enable TCP, UDP, or both"));
-  }
-
-  std::string_view address_text;
-  std::string_view port_text;
-  if (endpoint_text.starts_with('[')) {
-    const std::size_t close = endpoint_text.find(']');
-    if (close == std::string::npos || close + 2 > endpoint_text.size() ||
-        endpoint_text[close + 1] != ':') {
-      return std::unexpected(error(ExitCode::usage_or_config,
-                                   ERROR_INVALID_DATA,
-                                   L"IPv6 endpoints must use [address]:port"));
-    }
-    address_text = endpoint_text.substr(1, close - 1);
-    port_text = endpoint_text.substr(close + 2);
-    endpoint.ipv6 = true;
-  } else {
-    const std::size_t colon = endpoint_text.rfind(':');
-    if (colon == std::string::npos || endpoint_text.find(':') != colon) {
-      return std::unexpected(error(ExitCode::usage_or_config,
-                                   ERROR_INVALID_DATA,
-                                   L"IPv4 endpoints must use address:port"));
-    }
-    address_text = endpoint_text.substr(0, colon);
-    port_text = endpoint_text.substr(colon + 1);
-  }
-  auto port = parse_port(port_text);
-  if (!port) {
-    return std::unexpected(port.error());
-  }
-  auto address_wide = utf8_to_wide(address_text);
-  if (!address_wide || address_wide->empty()) {
-    return std::unexpected(address_wide ? error(ExitCode::usage_or_config,
-                                                ERROR_INVALID_ADDRESS,
-                                                L"Endpoint address is empty")
-                                        : address_wide.error());
-  }
-  const int family = endpoint.ipv6 ? AF_INET6 : AF_INET;
-  const int parsed =
-      InetPtonW(family, address_wide->c_str(), endpoint.address.data());
-  if (parsed != 1) {
-    return std::unexpected(
-        error(ExitCode::usage_or_config, ERROR_INVALID_ADDRESS,
-              L"[wfp-allow] keys must contain exact IPv4 or IPv6 literals"));
-  }
-  if (endpoint.ipv6 && is_v4_mapped(endpoint.address)) {
-    return std::unexpected(
-        error(ExitCode::usage_or_config, ERROR_INVALID_ADDRESS,
-              L"IPv4-mapped IPv6 endpoints must be written as IPv4 addresses"));
-  }
-  endpoint.port = *port;
-  return endpoint;
-}
-
-bool same_endpoint(const Config::Endpoint &left,
-                   const Config::Endpoint &right) {
-  return left.ipv6 == right.ipv6 && left.address == right.address &&
-         left.port == right.port;
-}
-
-Result<void> validate_config(const Config &config) {
-  if (config.account.empty() || config.policy_version == 0 ||
-      config.allow.empty()) {
-    return std::unexpected(error(ExitCode::usage_or_config, ERROR_INVALID_DATA,
-                                 L"[policy] account, policy_version, and at "
-                                 L"least one [wfp-allow] entry are required"));
-  }
-  return {};
 }
 
 Result<bool> is_elevated() {
@@ -283,15 +275,14 @@ Result<bool> is_elevated() {
     return std::unexpected(win32_error(ExitCode::precondition, GetLastError(),
                                        L"Create Administrators SID"));
   }
-  const auto release = [&] { FreeSid(administrators); };
   BOOL member{};
-  if (!CheckTokenMembership(nullptr, administrators, &member)) {
-    const DWORD code = GetLastError();
-    release();
+  const BOOL checked = CheckTokenMembership(nullptr, administrators, &member);
+  const DWORD code = checked ? ERROR_SUCCESS : GetLastError();
+  FreeSid(administrators);
+  if (!checked) {
     return std::unexpected(win32_error(ExitCode::precondition, code,
                                        L"Check administrator membership"));
   }
-  release();
   return member != FALSE;
 }
 
@@ -309,23 +300,23 @@ Result<void> require_elevation() {
 }
 
 Result<std::vector<std::byte>> resolve_account_sid(std::wstring_view account) {
-  std::wstring account_name(account);
+  std::wstring name(account);
   DWORD sid_size{};
   DWORD domain_size{};
   SID_NAME_USE use{};
-  LookupAccountNameW(nullptr, account_name.c_str(), nullptr, &sid_size, nullptr,
+  LookupAccountNameW(nullptr, name.c_str(), nullptr, &sid_size, nullptr,
                      &domain_size, &use);
   const DWORD first_error = GetLastError();
   if (first_error != ERROR_INSUFFICIENT_BUFFER || sid_size == 0) {
     return std::unexpected(win32_error(ExitCode::precondition, first_error,
-                                       L"Resolve configured account"));
+                                       L"Resolve local account"));
   }
   std::vector<std::byte> sid(sid_size);
   std::wstring domain(domain_size, L'\0');
-  if (!LookupAccountNameW(nullptr, account_name.c_str(), sid.data(), &sid_size,
+  if (!LookupAccountNameW(nullptr, name.c_str(), sid.data(), &sid_size,
                           domain.data(), &domain_size, &use)) {
     return std::unexpected(win32_error(ExitCode::precondition, GetLastError(),
-                                       L"Resolve configured account"));
+                                       L"Resolve local account"));
   }
   sid.resize(sid_size);
   return sid;
@@ -341,12 +332,20 @@ Result<std::wstring> sid_string(PSID sid) {
   return std::wstring(text);
 }
 
-Result<std::vector<std::byte>> security_descriptor(std::wstring_view sddl) {
+Result<std::vector<std::byte>> user_condition_descriptor(PSID sid) {
+  auto text = sid_string(sid);
+  if (!text) {
+    return std::unexpected(text.error());
+  }
   PSECURITY_DESCRIPTOR descriptor{};
+  // This descriptor is the FWPM_CONDITION_ALE_USER_ID match value, not the
+  // WFP object's management ACL. It binds each filter to the selected account
+  // SID so another user's traffic cannot satisfy the rule.
+  const std::wstring sddl = L"D:(A;;CC;;;" + *text + L")";
   if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
-          std::wstring(sddl).c_str(), SDDL_REVISION_1, &descriptor, nullptr)) {
+          sddl.c_str(), SDDL_REVISION_1, &descriptor, nullptr)) {
     return std::unexpected(win32_error(ExitCode::wfp, GetLastError(),
-                                       L"Build security descriptor"));
+                                       L"Build target-user condition"));
   }
   LocalMemory memory(descriptor, LocalFree);
   const DWORD size = GetSecurityDescriptorLength(descriptor);
@@ -355,16 +354,38 @@ Result<std::vector<std::byte>> security_descriptor(std::wstring_view sddl) {
   return result;
 }
 
-Result<std::vector<std::byte>> user_condition_descriptor(PSID sid) {
-  auto text = sid_string(sid);
-  if (!text) {
-    return std::unexpected(text.error());
+Result<std::vector<std::byte>> wfp_object_descriptor() {
+  PSECURITY_DESCRIPTOR descriptor{};
+  if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
+          detail::expected_wfp_object_dacl_sddl, SDDL_REVISION_1, &descriptor,
+          nullptr)) {
+    return std::unexpected(win32_error(ExitCode::wfp, GetLastError(),
+                                       L"Build WFP object access control"));
   }
-  return security_descriptor(L"D:(A;;CC;;;" + *text + L")");
+  LocalMemory memory(descriptor, LocalFree);
+  const DWORD size = GetSecurityDescriptorLength(descriptor);
+  std::vector<std::byte> result(size);
+  std::memcpy(result.data(), descriptor, size);
+  return result;
 }
 
-Result<std::vector<std::byte>> wfp_object_descriptor() {
-  return security_descriptor(L"D:(A;;GA;;;SY)(A;;GA;;;BA)");
+Result<PACL> wfp_object_dacl(const std::vector<std::byte> &descriptor) {
+  if (descriptor.empty()) {
+    return std::unexpected(error(ExitCode::wfp, ERROR_INVALID_DATA,
+                                 L"WFP object access control is empty"));
+  }
+  BOOL present{};
+  BOOL defaulted{};
+  PACL dacl{};
+  const auto security_descriptor = reinterpret_cast<PSECURITY_DESCRIPTOR>(
+      const_cast<std::byte *>(descriptor.data()));
+  if (!GetSecurityDescriptorDacl(security_descriptor, &present, &dacl,
+                                 &defaulted) ||
+      !present || !dacl) {
+    return std::unexpected(error(ExitCode::wfp, ERROR_INVALID_DATA,
+                                 L"WFP object access control has no DACL"));
+  }
+  return dacl;
 }
 
 Result<Engine> open_engine(ExitCode exit_code = ExitCode::wfp) {
@@ -379,18 +400,18 @@ Result<Engine> open_engine(ExitCode exit_code = ExitCode::wfp) {
 
 std::vector<UINT8> policy_identity(PSID sid) {
   const auto size = GetLengthSid(sid);
-  std::vector<UINT8> result(policy_tag_prefix.begin(), policy_tag_prefix.end());
+  std::vector<UINT8> identity(policy_tag.begin(), policy_tag.end());
   const auto *sid_bytes = static_cast<const UINT8 *>(sid);
-  result.insert(result.end(), sid_bytes, sid_bytes + size);
-  return result;
+  identity.insert(identity.end(), sid_bytes, sid_bytes + size);
+  return identity;
 }
 
 std::vector<UINT8> policy_data(const std::vector<UINT8> &identity,
-                               std::uint32_t version) {
-  std::vector<UINT8> result = identity;
-  const auto *version_bytes = reinterpret_cast<const UINT8 *>(&version);
-  result.insert(result.end(), version_bytes, version_bytes + sizeof(version));
-  return result;
+                               std::uint16_t port) {
+  std::vector<UINT8> data = identity;
+  const auto *port_bytes = reinterpret_cast<const UINT8 *>(&port);
+  data.insert(data.end(), port_bytes, port_bytes + sizeof(port));
+  return data;
 }
 
 bool same_blob(const FWP_BYTE_BLOB &blob, const std::vector<UINT8> &expected) {
@@ -402,8 +423,8 @@ bool is_owned_for(const FWPM_FILTER0 &filter,
                   const std::vector<UINT8> &identity) {
   return filter.providerKey && IsEqualGUID(*filter.providerKey, provider_key) &&
          IsEqualGUID(filter.subLayerKey, sublayer_key) &&
-         filter.providerData.size == identity.size() + sizeof(std::uint32_t) &&
          filter.providerData.data &&
+         filter.providerData.size == identity.size() + sizeof(std::uint16_t) &&
          std::memcmp(filter.providerData.data, identity.data(),
                      identity.size()) == 0;
 }
@@ -420,34 +441,116 @@ const FWPM_FILTER_CONDITION0 *find_condition(const FWPM_FILTER0 &filter,
 
 bool same_user_descriptor(const FWP_BYTE_BLOB *actual,
                           const std::vector<std::byte> &expected) {
-  if (!actual || !actual->data || expected.empty()) {
-    return false;
+  return actual && actual->data &&
+         detail::same_access_control_descriptor(
+             reinterpret_cast<PSECURITY_DESCRIPTOR>(actual->data),
+             reinterpret_cast<PSECURITY_DESCRIPTOR>(
+                 const_cast<std::byte *>(expected.data())));
+}
+
+std::wstring descriptor_dacl_sddl(PSECURITY_DESCRIPTOR descriptor) {
+  LPWSTR text{};
+  if (!ConvertSecurityDescriptorToStringSecurityDescriptorW(
+          descriptor, SDDL_REVISION_1, DACL_SECURITY_INFORMATION, &text,
+          nullptr)) {
+    return L"<unavailable>";
   }
-  const auto actual_descriptor =
-      reinterpret_cast<PSECURITY_DESCRIPTOR>(actual->data);
-  const auto expected_descriptor = reinterpret_cast<PSECURITY_DESCRIPTOR>(
-      const_cast<std::byte *>(expected.data()));
-  if (!IsValidSecurityDescriptor(actual_descriptor) ||
-      !IsValidSecurityDescriptor(expected_descriptor)) {
-    return false;
+  LocalMemory memory(text, LocalFree);
+  return text;
+}
+
+Result<void> verify_provider_access(HANDLE engine,
+                                    const std::vector<std::byte> &expected) {
+  PSECURITY_DESCRIPTOR actual{};
+  const DWORD code = FwpmProviderGetSecurityInfoByKey0(
+      engine, &provider_key, DACL_SECURITY_INFORMATION, nullptr, nullptr,
+      nullptr, nullptr, &actual);
+  if (code != ERROR_SUCCESS) {
+    return std::unexpected(
+        win32_error(ExitCode::verification, code,
+                    L"Read wfp-tool provider access control"));
   }
-  BOOL actual_present{};
-  BOOL actual_defaulted{};
-  PACL actual_dacl{};
-  BOOL expected_present{};
-  BOOL expected_defaulted{};
-  PACL expected_dacl{};
-  if (!GetSecurityDescriptorDacl(actual_descriptor, &actual_present,
-                                 &actual_dacl, &actual_defaulted) ||
-      !GetSecurityDescriptorDacl(expected_descriptor, &expected_present,
-                                 &expected_dacl, &expected_defaulted) ||
-      actual_present != expected_present ||
-      actual_defaulted != expected_defaulted || actual_dacl == nullptr ||
-      expected_dacl == nullptr) {
-    return false;
+  const bool matches = detail::same_wfp_object_access_control_descriptor(
+      actual, reinterpret_cast<PSECURITY_DESCRIPTOR>(
+                  const_cast<std::byte *>(expected.data())));
+  const std::wstring actual_sddl = matches ? L"" : descriptor_dacl_sddl(actual);
+  FwpmFreeMemory0(reinterpret_cast<void **>(&actual));
+  if (!matches) {
+    return std::unexpected(error(
+        ExitCode::verification, ERROR_INVALID_DATA,
+        L"wfp-tool provider access control does not match: " + actual_sddl));
   }
-  return actual_dacl->AclSize == expected_dacl->AclSize &&
-         std::memcmp(actual_dacl, expected_dacl, actual_dacl->AclSize) == 0;
+  return {};
+}
+
+Result<void> verify_sublayer_access(HANDLE engine,
+                                    const std::vector<std::byte> &expected) {
+  PSECURITY_DESCRIPTOR actual{};
+  const DWORD code = FwpmSubLayerGetSecurityInfoByKey0(
+      engine, &sublayer_key, DACL_SECURITY_INFORMATION, nullptr, nullptr,
+      nullptr, nullptr, &actual);
+  if (code != ERROR_SUCCESS) {
+    return std::unexpected(
+        win32_error(ExitCode::verification, code,
+                    L"Read wfp-tool sublayer access control"));
+  }
+  const bool matches = detail::same_wfp_object_access_control_descriptor(
+      actual, reinterpret_cast<PSECURITY_DESCRIPTOR>(
+                  const_cast<std::byte *>(expected.data())));
+  FwpmFreeMemory0(reinterpret_cast<void **>(&actual));
+  if (!matches) {
+    return std::unexpected(
+        error(ExitCode::verification, ERROR_INVALID_DATA,
+              L"wfp-tool sublayer access control does not match"));
+  }
+  return {};
+}
+
+Result<void> verify_filter_access(HANDLE engine, const GUID &key,
+                                  const std::vector<std::byte> &expected) {
+  PSECURITY_DESCRIPTOR actual{};
+  const DWORD code = FwpmFilterGetSecurityInfoByKey0(
+      engine, &key, DACL_SECURITY_INFORMATION, nullptr, nullptr, nullptr,
+      nullptr, &actual);
+  if (code != ERROR_SUCCESS) {
+    return std::unexpected(win32_error(ExitCode::verification, code,
+                                       L"Read wfp-tool filter access control"));
+  }
+  const bool matches = detail::same_wfp_object_access_control_descriptor(
+      actual, reinterpret_cast<PSECURITY_DESCRIPTOR>(
+                  const_cast<std::byte *>(expected.data())));
+  FwpmFreeMemory0(reinterpret_cast<void **>(&actual));
+  if (!matches) {
+    return std::unexpected(
+        error(ExitCode::verification, ERROR_INVALID_DATA,
+              L"wfp-tool filter access control does not match"));
+  }
+  return {};
+}
+
+bool has_expected_provider_properties(const FWPM_PROVIDER0 &provider) {
+  return provider.flags == FWPM_PROVIDER_FLAG_PERSISTENT;
+}
+
+bool has_expected_sublayer_properties(const FWPM_SUBLAYER0 &sublayer) {
+  return sublayer.flags == FWPM_SUBLAYER_FLAG_PERSISTENT &&
+         sublayer.providerKey &&
+         IsEqualGUID(*sublayer.providerKey, provider_key) &&
+         sublayer.weight >= sublayer_weight;
+}
+
+Error unexpected_sublayer_properties(ExitCode exit_code,
+                                     const FWPM_SUBLAYER0 &sublayer) {
+  const bool persistent = sublayer.flags == FWPM_SUBLAYER_FLAG_PERSISTENT;
+  const bool expected_provider =
+      sublayer.providerKey && IsEqualGUID(*sublayer.providerKey, provider_key);
+  const bool minimum_weight = sublayer.weight >= sublayer_weight;
+  return error(exit_code, ERROR_INVALID_DATA,
+               L"wfp-tool sublayer does not match the policy (persistent=" +
+                   std::to_wstring(persistent) + L", expected-provider=" +
+                   std::to_wstring(expected_provider) + L", minimum-weight=" +
+                   std::to_wstring(minimum_weight) + L", weight=" +
+                   std::to_wstring(sublayer.weight) + L")");
 }
 
 bool matches_user(const FWPM_FILTER0 &filter,
@@ -458,57 +561,11 @@ bool matches_user(const FWPM_FILTER0 &filter,
          same_user_descriptor(user->conditionValue.sd, user_sd);
 }
 
-bool descriptor_mentions_sid(const FWP_BYTE_BLOB *descriptor, PSID target_sid) {
-  if (!descriptor || !descriptor->data || !target_sid) {
-    return false;
-  }
-  const auto security_descriptor =
-      reinterpret_cast<PSECURITY_DESCRIPTOR>(descriptor->data);
-  BOOL present{};
-  BOOL defaulted{};
-  PACL dacl{};
-  if (!IsValidSecurityDescriptor(security_descriptor) ||
-      !GetSecurityDescriptorDacl(security_descriptor, &present, &dacl,
-                                 &defaulted) ||
-      !present || !dacl) {
-    return false;
-  }
-  for (DWORD index = 0; index < dacl->AceCount; ++index) {
-    void *raw_ace{};
-    if (!GetAce(dacl, index, &raw_ace)) {
-      return false;
-    }
-    const auto *header = static_cast<ACE_HEADER *>(raw_ace);
-    if (header->AceType != ACCESS_ALLOWED_ACE_TYPE &&
-        header->AceType != ACCESS_DENIED_ACE_TYPE) {
-      continue;
-    }
-    const auto *ace = static_cast<ACCESS_ALLOWED_ACE *>(raw_ace);
-    const auto ace_sid =
-        reinterpret_cast<PSID>(const_cast<DWORD *>(&ace->SidStart));
-    if (IsValidSid(ace_sid) && EqualSid(ace_sid, target_sid)) {
-      return true;
-    }
-  }
-  return false;
-}
-
-bool filter_mentions_user(const FWPM_FILTER0 &filter, PSID target_sid) {
-  const auto *user = find_condition(filter, FWPM_CONDITION_ALE_USER_ID);
-  return user && user->conditionValue.type == FWP_SECURITY_DESCRIPTOR_TYPE &&
-         descriptor_mentions_sid(user->conditionValue.sd, target_sid);
-}
-
 Result<void> enumerate_filters(
-    HANDLE engine, const GUID *provider,
+    HANDLE engine,
     const std::function<Result<void>(const FWPM_FILTER0 &)> &visitor) {
-  FWPM_FILTER_ENUM_TEMPLATE0 filter_template{};
-  filter_template.providerKey = const_cast<GUID *>(provider);
   HANDLE enumeration{};
-  DWORD code = FwpmFilterCreateEnumHandle0(
-      engine, provider ? &filter_template : nullptr, &enumeration);
-  // WFP reports this instead of an empty enumeration when the provider has
-  // never owned a filter. For list/remove, that is simply an empty policy.
+  DWORD code = FwpmFilterCreateEnumHandle0(engine, nullptr, &enumeration);
   if (code == FWP_E_NEVER_MATCH) {
     return {};
   }
@@ -543,53 +600,41 @@ Result<void> enumerate_filters(
   return {};
 }
 
-Result<void> enumerate_wfp_tool_filters(
-    HANDLE engine,
-    const std::function<Result<void>(const FWPM_FILTER0 &)> &visitor) {
-  // FwpmFilterCreateEnumHandle0 can report FWP_E_NEVER_MATCH for a
-  // providerKey-only template even while this provider has filters.  Enumerate
-  // once without a template and keep the provider boundary here instead.
-  return enumerate_filters(
-      engine, nullptr, [&](const FWPM_FILTER0 &filter) -> Result<void> {
-        return filter.providerKey &&
-                       IsEqualGUID(*filter.providerKey, provider_key)
-                   ? visitor(filter)
-                   : Result<void>{};
-      });
-}
-
-Result<void> enumerate_owned_filters(
-    HANDLE engine, const std::vector<UINT8> &identity,
-    const std::function<Result<void>(const FWPM_FILTER0 &)> &visitor) {
-  return enumerate_wfp_tool_filters(
-      engine, [&](const FWPM_FILTER0 &filter) -> Result<void> {
-        return is_owned_for(filter, identity) ? visitor(filter)
-                                              : Result<void>{};
-      });
-}
-
-Result<void> ensure_infrastructure(HANDLE engine,
-                                   PSECURITY_DESCRIPTOR object_sd) {
-  FWPM_PROVIDER0 *existing_provider{};
-  DWORD code = FwpmProviderGetByKey0(engine, &provider_key, &existing_provider);
+Result<void>
+ensure_infrastructure(HANDLE engine,
+                      const std::vector<std::byte> &object_descriptor) {
+  auto dacl = wfp_object_dacl(object_descriptor);
+  if (!dacl) {
+    return std::unexpected(dacl.error());
+  }
+  FWPM_PROVIDER0 *provider{};
+  DWORD code = FwpmProviderGetByKey0(engine, &provider_key, &provider);
   if (code == ERROR_SUCCESS) {
-    const bool valid =
-        (existing_provider->flags & FWPM_PROVIDER_FLAG_PERSISTENT) != 0 &&
-        existing_provider->serviceName == nullptr;
-    FwpmFreeMemory0(reinterpret_cast<void **>(&existing_provider));
-    if (!valid) {
+    const bool properties_match = has_expected_provider_properties(*provider);
+    FwpmFreeMemory0(reinterpret_cast<void **>(&provider));
+    if (!properties_match) {
       return std::unexpected(
           error(ExitCode::wfp, ERROR_INVALID_DATA,
-                L"Existing wfp-tool provider metadata is invalid"));
+                L"Existing wfp-tool provider does not match the policy"));
+    }
+    code = FwpmProviderSetSecurityInfoByKey0(engine, &provider_key,
+                                             DACL_SECURITY_INFORMATION, nullptr,
+                                             nullptr, *dacl, nullptr);
+    if (code != ERROR_SUCCESS) {
+      return std::unexpected(win32_error(
+          ExitCode::wfp, code, L"Restore wfp-tool provider access control"));
     }
   } else if (code == FWP_E_PROVIDER_NOT_FOUND) {
-    FWPM_PROVIDER0 provider{};
-    provider.providerKey = provider_key;
-    provider.displayData.name = const_cast<wchar_t *>(L"wfp-tool Provider");
-    provider.displayData.description = const_cast<wchar_t *>(
-        L"Persistent per-user allowlist and default-deny WFP policies");
-    provider.flags = FWPM_PROVIDER_FLAG_PERSISTENT;
-    code = FwpmProviderAdd0(engine, &provider, object_sd);
+    FWPM_PROVIDER0 new_provider{};
+    new_provider.providerKey = provider_key;
+    new_provider.displayData.name = const_cast<wchar_t *>(L"wfp-tool Provider");
+    new_provider.displayData.description =
+        const_cast<wchar_t *>(L"Persistent per-user loopback-only filters");
+    new_provider.flags = FWPM_PROVIDER_FLAG_PERSISTENT;
+    code = FwpmProviderAdd0(
+        engine, &new_provider,
+        reinterpret_cast<PSECURITY_DESCRIPTOR>(
+            const_cast<std::byte *>(object_descriptor.data())));
     if (code != ERROR_SUCCESS) {
       return std::unexpected(
           win32_error(ExitCode::wfp, code, L"Add wfp-tool provider"));
@@ -599,112 +644,79 @@ Result<void> ensure_infrastructure(HANDLE engine,
         win32_error(ExitCode::wfp, code, L"Read wfp-tool provider"));
   }
 
-  const auto add_sublayer = [&]() -> Result<void> {
-    FWPM_SUBLAYER0 sublayer{};
-    sublayer.subLayerKey = sublayer_key;
-    sublayer.displayData.name = const_cast<wchar_t *>(L"wfp-tool Sublayer");
-    sublayer.displayData.description = const_cast<wchar_t *>(
-        L"Per-user allowlist permits above default-deny blocks");
-    sublayer.flags = FWPM_SUBLAYER_FLAG_PERSISTENT;
-    sublayer.providerKey = const_cast<GUID *>(&provider_key);
-    sublayer.weight = sublayer_weight;
-    code = FwpmSubLayerAdd0(engine, &sublayer, object_sd);
+  FWPM_SUBLAYER0 *sublayer{};
+  code = FwpmSubLayerGetByKey0(engine, &sublayer_key, &sublayer);
+  if (code == ERROR_SUCCESS) {
+    const bool properties_match = has_expected_sublayer_properties(*sublayer);
+    if (!properties_match) {
+      const Error mismatch =
+          unexpected_sublayer_properties(ExitCode::wfp, *sublayer);
+      FwpmFreeMemory0(reinterpret_cast<void **>(&sublayer));
+      return std::unexpected(mismatch);
+    }
+    FwpmFreeMemory0(reinterpret_cast<void **>(&sublayer));
+    code = FwpmSubLayerSetSecurityInfoByKey0(engine, &sublayer_key,
+                                             DACL_SECURITY_INFORMATION, nullptr,
+                                             nullptr, *dacl, nullptr);
     if (code != ERROR_SUCCESS) {
-      return std::unexpected(
-          win32_error(ExitCode::wfp, code, L"Add wfp-tool sublayer"));
+      return std::unexpected(win32_error(
+          ExitCode::wfp, code, L"Restore wfp-tool sublayer access control"));
     }
     return {};
-  };
-
-  FWPM_SUBLAYER0 *existing_sublayer{};
-  code = FwpmSubLayerGetByKey0(engine, &sublayer_key, &existing_sublayer);
-  if (code == ERROR_SUCCESS) {
-    FwpmFreeMemory0(reinterpret_cast<void **>(&existing_sublayer));
-  } else if (code == FWP_E_SUBLAYER_NOT_FOUND) {
-    return add_sublayer();
-  } else {
+  }
+  if (code != FWP_E_SUBLAYER_NOT_FOUND) {
     return std::unexpected(
         win32_error(ExitCode::wfp, code, L"Read wfp-tool sublayer"));
   }
+
+  FWPM_SUBLAYER0 new_sublayer{};
+  new_sublayer.subLayerKey = sublayer_key;
+  new_sublayer.displayData.name = const_cast<wchar_t *>(L"wfp-tool Sublayer");
+  new_sublayer.displayData.description = const_cast<wchar_t *>(
+      L"Per-user loopback permits above default-deny blocks");
+  new_sublayer.flags = FWPM_SUBLAYER_FLAG_PERSISTENT;
+  new_sublayer.providerKey = const_cast<GUID *>(&provider_key);
+  new_sublayer.weight = sublayer_weight;
+  code =
+      FwpmSubLayerAdd0(engine, &new_sublayer,
+                       reinterpret_cast<PSECURITY_DESCRIPTOR>(
+                           const_cast<std::byte *>(object_descriptor.data())));
+  if (code != ERROR_SUCCESS) {
+    return std::unexpected(
+        win32_error(ExitCode::wfp, code, L"Add wfp-tool sublayer"));
+  }
   return {};
 }
 
-Result<void> verify_infrastructure(HANDLE engine) {
-  FWPM_PROVIDER0 *provider{};
-  DWORD code = FwpmProviderGetByKey0(engine, &provider_key, &provider);
-  if (code != ERROR_SUCCESS) {
-    return std::unexpected(
-        win32_error(ExitCode::verification, code, L"Read wfp-tool provider"));
-  }
-  const bool provider_valid =
-      (provider->flags & FWPM_PROVIDER_FLAG_PERSISTENT) != 0 &&
-      provider->serviceName == nullptr;
-  FwpmFreeMemory0(reinterpret_cast<void **>(&provider));
-  if (!provider_valid) {
-    return std::unexpected(
-        error(ExitCode::verification, ERROR_INVALID_DATA,
-              L"Existing wfp-tool provider metadata is invalid"));
-  }
-
-  FWPM_SUBLAYER0 *sublayer{};
-  code = FwpmSubLayerGetByKey0(engine, &sublayer_key, &sublayer);
-  if (code != ERROR_SUCCESS) {
-    return std::unexpected(
-        win32_error(ExitCode::verification, code, L"Read wfp-tool sublayer"));
-  }
-  FwpmFreeMemory0(reinterpret_cast<void **>(&sublayer));
-  return {};
-}
-
-std::vector<Rule> build_rules(const Config &config) {
+std::vector<Rule> build_rules(std::uint16_t port) {
   std::vector<Rule> rules;
-  const auto permit = [&](const GUID &layer, std::uint8_t protocol,
+  const auto permit = [&](const GUID &layer,
                           std::optional<std::uint32_t> address_v4,
-                          std::optional<std::array<UINT8, 16>> address_v6,
-                          std::uint16_t port) {
-    rules.push_back(Rule{&layer, FWP_ACTION_PERMIT, permit_weight, protocol,
-                         address_v4, address_v6, port});
+                          std::optional<std::array<UINT8, 16>> address_v6) {
+    rules.push_back(Rule{&layer, FWP_ACTION_PERMIT, permit_weight,
+                         static_cast<std::uint8_t>(IPPROTO_TCP), address_v4,
+                         address_v6, port});
   };
-  for (const auto &endpoint : config.allow) {
+  permit(FWPM_LAYER_ALE_AUTH_CONNECT_V4, 0x7f000001, std::nullopt);
+  permit(FWPM_LAYER_ALE_AUTH_CONNECT_V6, std::nullopt, loopback_v6);
+  permit(FWPM_LAYER_ALE_AUTH_CONNECT_V6, std::nullopt, mapped_loopback_v6);
+
+  for (const GUID *layer :
+       {&FWPM_LAYER_ALE_AUTH_CONNECT_V4, &FWPM_LAYER_ALE_AUTH_CONNECT_V6}) {
     for (const std::uint8_t protocol :
          {static_cast<std::uint8_t>(IPPROTO_TCP),
           static_cast<std::uint8_t>(IPPROTO_UDP)}) {
-      if ((protocol == IPPROTO_TCP && !endpoint.tcp) ||
-          (protocol == IPPROTO_UDP && !endpoint.udp)) {
-        continue;
-      }
-      if (endpoint.ipv6) {
-        permit(FWPM_LAYER_ALE_AUTH_CONNECT_V6, protocol, std::nullopt,
-               endpoint.address, endpoint.port);
-      } else {
-        std::uint32_t network_address{};
-        std::memcpy(&network_address, endpoint.address.data(),
-                    sizeof(network_address));
-        const std::uint32_t address = ntohl(network_address);
-        permit(FWPM_LAYER_ALE_AUTH_CONNECT_V4, protocol, address, std::nullopt,
-               endpoint.port);
-        std::array<UINT8, 16> mapped{};
-        mapped[10] = 0xff;
-        mapped[11] = 0xff;
-        std::copy_n(endpoint.address.begin(), 4, mapped.begin() + 12);
-        permit(FWPM_LAYER_ALE_AUTH_CONNECT_V6, protocol, std::nullopt, mapped,
-               endpoint.port);
-      }
+      rules.push_back(Rule{layer, FWP_ACTION_BLOCK, block_weight, protocol,
+                           std::nullopt, std::nullopt, std::nullopt});
     }
   }
-  rules.push_back(Rule{&FWPM_LAYER_ALE_AUTH_CONNECT_V4, FWP_ACTION_BLOCK,
-                       block_weight, std::nullopt, std::nullopt, std::nullopt,
-                       std::nullopt});
-  rules.push_back(Rule{&FWPM_LAYER_ALE_AUTH_CONNECT_V6, FWP_ACTION_BLOCK,
-                       block_weight, std::nullopt, std::nullopt, std::nullopt,
-                       std::nullopt});
   return rules;
 }
 
 Result<void> add_rule(HANDLE engine, const Rule &rule,
                       FWP_BYTE_BLOB &user_descriptor,
                       const std::vector<UINT8> &data,
-                      PSECURITY_DESCRIPTOR object_sd) {
+                      PSECURITY_DESCRIPTOR object_descriptor) {
   std::array<FWPM_FILTER_CONDITION0, 4> conditions{};
   UINT32 count{};
   conditions[count].fieldKey = FWPM_CONDITION_ALE_USER_ID;
@@ -712,13 +724,13 @@ Result<void> add_rule(HANDLE engine, const Rule &rule,
   conditions[count].conditionValue.type = FWP_SECURITY_DESCRIPTOR_TYPE;
   conditions[count].conditionValue.sd = &user_descriptor;
   ++count;
-  if (rule.protocol) {
-    conditions[count].fieldKey = FWPM_CONDITION_IP_PROTOCOL;
-    conditions[count].matchType = FWP_MATCH_EQUAL;
-    conditions[count].conditionValue.type = FWP_UINT8;
-    conditions[count].conditionValue.uint8 = *rule.protocol;
-    ++count;
-  }
+
+  conditions[count].fieldKey = FWPM_CONDITION_IP_PROTOCOL;
+  conditions[count].matchType = FWP_MATCH_EQUAL;
+  conditions[count].conditionValue.type = FWP_UINT8;
+  conditions[count].conditionValue.uint8 = rule.protocol;
+  ++count;
+
   FWP_BYTE_ARRAY16 address_v6{};
   if (rule.address_v4) {
     conditions[count].fieldKey = FWPM_CONDITION_IP_REMOTE_ADDRESS;
@@ -742,15 +754,16 @@ Result<void> add_rule(HANDLE engine, const Rule &rule,
     conditions[count].conditionValue.uint16 = *rule.port;
     ++count;
   }
+
   FWP_VALUE0 weight{};
   weight.type = FWP_UINT64;
   weight.uint64 = const_cast<UINT64 *>(&rule.weight);
   FWP_BYTE_BLOB provider_data{static_cast<UINT32>(data.size()),
                               const_cast<UINT8 *>(data.data())};
   FWPM_FILTER0 filter{};
-  filter.displayData.name = const_cast<wchar_t *>(L"wfp-tool policy rule");
+  filter.displayData.name = const_cast<wchar_t *>(L"wfp-tool loopback rule");
   filter.displayData.description = const_cast<wchar_t *>(
-      L"Per-user allowlist or default-deny rule managed by wfp-tool");
+      L"Per-user loopback proxy permit or default-deny rule");
   filter.flags = FWPM_FILTER_FLAG_PERSISTENT;
   filter.providerKey = const_cast<GUID *>(&provider_key);
   filter.providerData = provider_data;
@@ -760,7 +773,8 @@ Result<void> add_rule(HANDLE engine, const Rule &rule,
   filter.numFilterConditions = count;
   filter.filterCondition = conditions.data();
   filter.action.type = rule.action;
-  const DWORD code = FwpmFilterAdd0(engine, &filter, object_sd, nullptr);
+  const DWORD code =
+      FwpmFilterAdd0(engine, &filter, object_descriptor, nullptr);
   if (code != ERROR_SUCCESS) {
     return std::unexpected(
         win32_error(ExitCode::wfp, code, L"Add wfp-tool filter"));
@@ -768,20 +782,20 @@ Result<void> add_rule(HANDLE engine, const Rule &rule,
   return {};
 }
 
-Result<void> delete_wfp_tool_filters_for_user(HANDLE engine, PSID target_sid) {
+Result<void> delete_user_filters(HANDLE engine,
+                                 const std::vector<UINT8> &identity) {
   std::vector<GUID> keys;
-  auto enumerated =
-      enumerate_wfp_tool_filters(engine, [&](const FWPM_FILTER0 &filter) {
-        if (IsEqualGUID(filter.subLayerKey, sublayer_key) &&
-            filter_mentions_user(filter, target_sid)) {
+  auto enumerated = enumerate_filters(
+      engine, [&](const FWPM_FILTER0 &filter) -> Result<void> {
+        if (is_owned_for(filter, identity)) {
           keys.push_back(filter.filterKey);
         }
-        return Result<void>{};
+        return {};
       });
   if (!enumerated) {
     return std::unexpected(enumerated.error());
   }
-  for (const auto &key : keys) {
+  for (const GUID &key : keys) {
     const DWORD code = FwpmFilterDeleteByKey0(engine, &key);
     if (code != ERROR_SUCCESS) {
       return std::unexpected(
@@ -791,15 +805,15 @@ Result<void> delete_wfp_tool_filters_for_user(HANDLE engine, PSID target_sid) {
   return {};
 }
 
-Result<void> remove_unused_wfp_tool_infrastructure(HANDLE engine) {
+Result<void> remove_unused_infrastructure(HANDLE engine) {
   bool referenced{};
-  auto enumerated =
-      enumerate_filters(engine, nullptr, [&](const FWPM_FILTER0 &filter) {
+  auto enumerated = enumerate_filters(
+      engine, [&](const FWPM_FILTER0 &filter) -> Result<void> {
         referenced = referenced ||
                      IsEqualGUID(filter.subLayerKey, sublayer_key) ||
                      (filter.providerKey &&
                       IsEqualGUID(*filter.providerKey, provider_key));
-        return Result<void>{};
+        return {};
       });
   if (!enumerated) {
     return std::unexpected(enumerated.error());
@@ -807,7 +821,6 @@ Result<void> remove_unused_wfp_tool_infrastructure(HANDLE engine) {
   if (referenced) {
     return {};
   }
-
   DWORD code = FwpmSubLayerDeleteByKey0(engine, &sublayer_key);
   if (code != ERROR_SUCCESS && code != FWP_E_SUBLAYER_NOT_FOUND) {
     return std::unexpected(
@@ -821,20 +834,41 @@ Result<void> remove_unused_wfp_tool_infrastructure(HANDLE engine) {
   return {};
 }
 
-Result<void> clear_user_filters(HANDLE engine, PSID target_sid) {
-  auto removed = delete_wfp_tool_filters_for_user(engine, target_sid);
+Result<void> clear_user_policy(PSID sid) {
+  auto engine = open_engine();
+  if (!engine) {
+    return std::unexpected(engine.error());
+  }
+  const DWORD begin = FwpmTransactionBegin0(engine->value, 0);
+  if (begin != ERROR_SUCCESS) {
+    return std::unexpected(win32_error(ExitCode::wfp, begin,
+                                       L"Begin wfp-tool removal transaction"));
+  }
+  const auto identity = policy_identity(sid);
+  auto deleted = delete_user_filters(engine->value, identity);
+  if (!deleted) {
+    FwpmTransactionAbort0(engine->value);
+    return std::unexpected(deleted.error());
+  }
+  auto removed = remove_unused_infrastructure(engine->value);
   if (!removed) {
+    FwpmTransactionAbort0(engine->value);
     return std::unexpected(removed.error());
   }
-  return remove_unused_wfp_tool_infrastructure(engine);
+  const DWORD commit = FwpmTransactionCommit0(engine->value);
+  if (commit != ERROR_SUCCESS) {
+    FwpmTransactionAbort0(engine->value);
+    return std::unexpected(win32_error(ExitCode::wfp, commit,
+                                       L"Commit wfp-tool removal transaction"));
+  }
+  return {};
 }
 
 bool matches_rule(const FWPM_FILTER0 &filter, const Rule &expected,
                   const std::vector<UINT8> &data,
                   const std::vector<std::byte> &user_sd) {
-  const UINT32 condition_count =
-      1 + (expected.protocol ? 1 : 0) +
-      (expected.address_v4 || expected.address_v6 ? 1 : 0) +
+  const UINT32 expected_conditions =
+      2 + (expected.address_v4 || expected.address_v6 ? 1 : 0) +
       (expected.port ? 1 : 0);
   if (!filter.providerKey || !IsEqualGUID(*filter.providerKey, provider_key) ||
       !IsEqualGUID(filter.subLayerKey, sublayer_key) ||
@@ -843,20 +877,15 @@ bool matches_rule(const FWPM_FILTER0 &filter, const Rule &expected,
       filter.action.type != expected.action ||
       filter.weight.type != FWP_UINT64 || !filter.weight.uint64 ||
       *filter.weight.uint64 != expected.weight ||
-      filter.numFilterConditions != condition_count ||
-      !same_blob(filter.providerData, data)) {
+      filter.numFilterConditions != expected_conditions ||
+      !same_blob(filter.providerData, data) || !matches_user(filter, user_sd)) {
     return false;
   }
-  if (!matches_user(filter, user_sd)) {
+  const auto *protocol = find_condition(filter, FWPM_CONDITION_IP_PROTOCOL);
+  if (!protocol || protocol->matchType != FWP_MATCH_EQUAL ||
+      protocol->conditionValue.type != FWP_UINT8 ||
+      protocol->conditionValue.uint8 != expected.protocol) {
     return false;
-  }
-  if (expected.protocol) {
-    const auto *protocol = find_condition(filter, FWPM_CONDITION_IP_PROTOCOL);
-    if (!protocol || protocol->matchType != FWP_MATCH_EQUAL ||
-        protocol->conditionValue.type != FWP_UINT8 ||
-        protocol->conditionValue.uint8 != *expected.protocol) {
-      return false;
-    }
   }
   if (expected.address_v4 || expected.address_v6) {
     const auto *address =
@@ -888,51 +917,99 @@ bool matches_rule(const FWPM_FILTER0 &filter, const Rule &expected,
   return true;
 }
 
-Result<void> verify_wfp_policy(const Config &config, PSID sid) {
+Result<void> verify_loopback_policy(PSID sid, std::uint16_t port) {
   auto engine = open_engine(ExitCode::verification);
   if (!engine) {
     return std::unexpected(engine.error());
   }
-  auto infrastructure = verify_infrastructure(engine->value);
-  if (!infrastructure) {
-    return std::unexpected(infrastructure.error());
+  FWPM_PROVIDER0 *provider{};
+  const DWORD provider_result =
+      FwpmProviderGetByKey0(engine->value, &provider_key, &provider);
+  if (provider_result != ERROR_SUCCESS) {
+    return std::unexpected(win32_error(ExitCode::verification, provider_result,
+                                       L"Read wfp-tool provider"));
   }
+  const bool provider_properties_match =
+      has_expected_provider_properties(*provider);
+  FwpmFreeMemory0(reinterpret_cast<void **>(&provider));
+  if (!provider_properties_match) {
+    return std::unexpected(
+        error(ExitCode::verification, ERROR_INVALID_DATA,
+              L"wfp-tool provider does not match the policy"));
+  }
+  FWPM_SUBLAYER0 *sublayer{};
+  const DWORD sublayer_result =
+      FwpmSubLayerGetByKey0(engine->value, &sublayer_key, &sublayer);
+  if (sublayer_result != ERROR_SUCCESS) {
+    return std::unexpected(win32_error(ExitCode::verification, sublayer_result,
+                                       L"Read wfp-tool sublayer"));
+  }
+  const bool sublayer_properties_match =
+      has_expected_sublayer_properties(*sublayer);
+  if (!sublayer_properties_match) {
+    const Error mismatch =
+        unexpected_sublayer_properties(ExitCode::verification, *sublayer);
+    FwpmFreeMemory0(reinterpret_cast<void **>(&sublayer));
+    return std::unexpected(mismatch);
+  }
+  FwpmFreeMemory0(reinterpret_cast<void **>(&sublayer));
+
   auto user_sd = user_condition_descriptor(sid);
   if (!user_sd) {
     return std::unexpected(user_sd.error());
   }
+  auto object_sd = wfp_object_descriptor();
+  if (!object_sd) {
+    return std::unexpected(object_sd.error());
+  }
+  auto provider_access = verify_provider_access(engine->value, *object_sd);
+  if (!provider_access) {
+    return std::unexpected(provider_access.error());
+  }
+  auto sublayer_access = verify_sublayer_access(engine->value, *object_sd);
+  if (!sublayer_access) {
+    return std::unexpected(sublayer_access.error());
+  }
   const auto identity = policy_identity(sid);
-  const auto data = policy_data(identity, config.policy_version);
-  const auto expected = build_rules(config);
+  const auto data = policy_data(identity, port);
+  const auto expected = build_rules(port);
   std::vector<bool> matched(expected.size());
   std::size_t found{};
-  auto enumerated = enumerate_owned_filters(
-      engine->value, identity, [&](const FWPM_FILTER0 &filter) -> Result<void> {
+  auto enumerated = enumerate_filters(
+      engine->value, [&](const FWPM_FILTER0 &filter) -> Result<void> {
+        if (!is_owned_for(filter, identity)) {
+          return {};
+        }
         ++found;
         for (std::size_t index = 0; index < expected.size(); ++index) {
           if (!matched[index] &&
               matches_rule(filter, expected[index], data, *user_sd)) {
+            auto filter_access = verify_filter_access(
+                engine->value, filter.filterKey, *object_sd);
+            if (!filter_access) {
+              return std::unexpected(filter_access.error());
+            }
             matched[index] = true;
-            return Result<void>{};
+            return {};
           }
         }
         return std::unexpected(
             error(ExitCode::verification, ERROR_INVALID_DATA,
-                  L"Installed wfp-tool policy contains an unexpected filter"));
+                  L"Installed loopback policy contains an unexpected filter"));
       });
   if (!enumerated) {
     return std::unexpected(enumerated.error());
   }
   if (found != expected.size() ||
       std::find(matched.begin(), matched.end(), false) != matched.end()) {
-    return std::unexpected(
-        error(ExitCode::verification, ERROR_INVALID_DATA,
-              L"Installed wfp-tool filters do not match the configuration"));
+    return std::unexpected(error(ExitCode::verification, ERROR_INVALID_DATA,
+                                 L"Installed loopback filters do not match the "
+                                 L"requested user and port"));
   }
   return {};
 }
 
-Result<void> apply_wfp_policy(const Config &config, PSID sid) {
+Result<void> apply_loopback_policy(PSID sid, std::uint16_t port) {
   auto engine = open_engine();
   if (!engine) {
     return std::unexpected(engine.error());
@@ -944,6 +1021,10 @@ Result<void> apply_wfp_policy(const Config &config, PSID sid) {
   auto object_sd = wfp_object_descriptor();
   if (!object_sd) {
     return std::unexpected(object_sd.error());
+  }
+  auto infrastructure = ensure_infrastructure(engine->value, *object_sd);
+  if (!infrastructure) {
+    return std::unexpected(infrastructure.error());
   }
   const DWORD begin = FwpmTransactionBegin0(engine->value, 0);
   if (begin != ERROR_SUCCESS) {
@@ -958,21 +1039,15 @@ Result<void> apply_wfp_policy(const Config &config, PSID sid) {
     }
   };
   const auto identity = policy_identity(sid);
-  auto cleared = clear_user_filters(engine->value, sid);
-  if (!cleared) {
+  auto deleted = delete_user_filters(engine->value, identity);
+  if (!deleted) {
     abort();
-    return std::unexpected(cleared.error());
-  }
-  auto infrastructure = ensure_infrastructure(
-      engine->value, static_cast<PSECURITY_DESCRIPTOR>(object_sd->data()));
-  if (!infrastructure) {
-    abort();
-    return std::unexpected(infrastructure.error());
+    return std::unexpected(deleted.error());
   }
   FWP_BYTE_BLOB user_blob{static_cast<UINT32>(user_sd->size()),
                           reinterpret_cast<UINT8 *>(user_sd->data())};
-  const auto data = policy_data(identity, config.policy_version);
-  for (const auto &rule : build_rules(config)) {
+  const auto data = policy_data(identity, port);
+  for (const Rule &rule : build_rules(port)) {
     auto added = add_rule(engine->value, rule, user_blob, data,
                           static_cast<PSECURITY_DESCRIPTOR>(object_sd->data()));
     if (!added) {
@@ -1012,126 +1087,65 @@ std::wstring address_text(const FWPM_FILTER_CONDITION0 *address) {
   return L"<invalid address>";
 }
 
-std::wstring guid_text(const GUID &guid) {
-  wchar_t buffer[39]{};
-  StringFromGUID2(guid, buffer, static_cast<int>(std::size(buffer)));
-  return buffer;
-}
-
-std::wstring provider_text(const GUID *key) {
-  if (!key) {
-    return L"<none>";
-  }
-  return IsEqualGUID(*key, provider_key) ? L"wfp-tool" : guid_text(*key);
-}
-
 std::wstring protocol_text(const FWPM_FILTER_CONDITION0 *protocol) {
-  if (!protocol) {
-    return L"any";
+  if (!protocol || protocol->conditionValue.type != FWP_UINT8) {
+    return L"<invalid protocol>";
   }
-  if (protocol->conditionValue.type == FWP_UINT8) {
-    if (protocol->conditionValue.uint8 == IPPROTO_TCP) {
-      return L"tcp";
-    }
-    if (protocol->conditionValue.uint8 == IPPROTO_UDP) {
-      return L"udp";
-    }
-    if (protocol->conditionValue.uint8 == IPPROTO_ICMP) {
-      return L"icmp";
-    }
-    if (protocol->conditionValue.uint8 == IPPROTO_ICMPV6) {
-      return L"icmpv6";
-    }
+  if (protocol->conditionValue.uint8 == IPPROTO_TCP) {
+    return L"tcp";
   }
-  return L"<invalid protocol>";
+  if (protocol->conditionValue.uint8 == IPPROTO_UDP) {
+    return L"udp";
+  }
+  return L"<other protocol>";
 }
 
-Result<void> apply_command(const std::filesystem::path &source) {
+Result<void> apply_command(std::wstring_view user, std::uint16_t port) {
   auto elevated = require_elevation();
   if (!elevated) {
     return std::unexpected(elevated.error());
   }
-  auto config = load_config(source);
-  if (!config) {
-    return std::unexpected(config.error());
-  }
-  auto sid = resolve_account_sid(config->account);
+  auto sid = resolve_account_sid(user);
   if (!sid) {
     return std::unexpected(sid.error());
   }
-  auto applied = apply_wfp_policy(*config, sid->data());
+  auto applied = apply_loopback_policy(sid->data(), port);
   if (!applied) {
     return std::unexpected(applied.error());
   }
-  return verify_wfp_policy(*config, sid->data());
+  return verify_loopback_policy(sid->data(), port);
 }
 
-Result<void> verify_command(const std::filesystem::path &source) {
+Result<void> verify_command(std::wstring_view user, std::uint16_t port) {
   auto elevated = require_elevation();
   if (!elevated) {
     return std::unexpected(elevated.error());
   }
-  auto config = load_config(source);
-  if (!config) {
-    return std::unexpected(config.error());
-  }
-  auto sid = resolve_account_sid(config->account);
+  auto sid = resolve_account_sid(user);
   if (!sid) {
     return std::unexpected(sid.error());
   }
-  return verify_wfp_policy(*config, sid->data());
+  return verify_loopback_policy(sid->data(), port);
 }
 
-Result<void> clear_user_policy(PSID sid) {
-  auto engine = open_engine();
-  if (!engine) {
-    return std::unexpected(engine.error());
-  }
-  const DWORD begin = FwpmTransactionBegin0(engine->value, 0);
-  if (begin != ERROR_SUCCESS) {
-    return std::unexpected(win32_error(ExitCode::wfp, begin,
-                                       L"Begin wfp-tool removal transaction"));
-  }
-  auto cleared = clear_user_filters(engine->value, sid);
-  if (!cleared) {
-    FwpmTransactionAbort0(engine->value);
-    return std::unexpected(cleared.error());
-  }
-  const DWORD commit = FwpmTransactionCommit0(engine->value);
-  if (commit != ERROR_SUCCESS) {
-    FwpmTransactionAbort0(engine->value);
-    return std::unexpected(win32_error(ExitCode::wfp, commit,
-                                       L"Commit wfp-tool removal transaction"));
-  }
-  return {};
-}
-
-Result<void> clear_command(std::wstring_view account) {
+Result<void> remove_command(std::wstring_view user) {
   auto elevated = require_elevation();
   if (!elevated) {
     return std::unexpected(elevated.error());
   }
-  auto sid = resolve_account_sid(account);
+  auto sid = resolve_account_sid(user);
   if (!sid) {
     return std::unexpected(sid.error());
   }
   return clear_user_policy(sid->data());
 }
 
-Result<void> remove_command(const std::filesystem::path &source) {
-  auto config = load_config(source);
-  if (!config) {
-    return std::unexpected(config.error());
-  }
-  return clear_command(config->account);
-}
-
-Result<void> list_command(std::wstring_view account) {
+Result<void> list_command(std::wstring_view user) {
   auto elevated = require_elevation();
   if (!elevated) {
     return std::unexpected(elevated.error());
   }
-  auto sid = resolve_account_sid(account);
+  auto sid = resolve_account_sid(user);
   if (!sid) {
     return std::unexpected(sid.error());
   }
@@ -1143,14 +1157,12 @@ Result<void> list_command(std::wstring_view account) {
   if (!engine) {
     return std::unexpected(engine.error());
   }
-  std::wcout << L"WFP filters for " << *text << L":\n";
+  const auto identity = policy_identity(sid->data());
+  std::wcout << L"wfp-tool loopback filters for " << *text << L":\n";
   std::size_t count{};
   auto enumerated = enumerate_filters(
-      engine->value, nullptr, [&](const FWPM_FILTER0 &filter) -> Result<void> {
-        const bool matches_account = filter_mentions_user(filter, sid->data());
-        const bool references_wfp_tool_sublayer =
-            IsEqualGUID(filter.subLayerKey, sublayer_key);
-        if (!matches_account && !references_wfp_tool_sublayer) {
+      engine->value, [&](const FWPM_FILTER0 &filter) -> Result<void> {
+        if (!is_owned_for(filter, identity)) {
           return {};
         }
         ++count;
@@ -1163,29 +1175,16 @@ Result<void> list_command(std::wstring_view account) {
         const wchar_t *layer =
             IsEqualGUID(filter.layerKey, FWPM_LAYER_ALE_AUTH_CONNECT_V4)
                 ? L"ALE_AUTH_CONNECT_V4"
-            : IsEqualGUID(filter.layerKey, FWPM_LAYER_ALE_AUTH_CONNECT_V6)
-                ? L"ALE_AUTH_CONNECT_V6"
-            : IsEqualGUID(filter.layerKey,
-                          FWPM_LAYER_ALE_RESOURCE_ASSIGNMENT_V4)
-                ? L"ALE_RESOURCE_ASSIGNMENT_V4"
-                : L"ALE_RESOURCE_ASSIGNMENT_V6";
+                : L"ALE_AUTH_CONNECT_V6";
         std::wcout << L"[" << filter.filterId << L"] "
-                   << (matches_account ? L"account " : L"wfp-tool-sublayer ")
                    << (filter.action.type == FWP_ACTION_PERMIT ? L"permit "
                                                                : L"block ")
                    << protocol_text(protocol) << L" " << address_text(address);
         if (port && port->conditionValue.type == FWP_UINT16) {
           std::wcout << L":" << port->conditionValue.uint16;
         }
-        std::wcout << L" at " << layer << L" (weight=";
-        if (filter.weight.type == FWP_UINT64 && filter.weight.uint64) {
-          std::wcout << *filter.weight.uint64;
-        } else {
-          std::wcout << L"invalid";
-        }
-        std::wcout << L", provider=" << provider_text(filter.providerKey)
-                   << L", key=" << guid_text(filter.filterKey) << L")\n";
-        return Result<void>{};
+        std::wcout << L" at " << layer << L"\n";
+        return {};
       });
   if (!enumerated) {
     return std::unexpected(enumerated.error());
@@ -1196,12 +1195,24 @@ Result<void> list_command(std::wstring_view account) {
   return {};
 }
 
+Result<UserPort> parse_user_port(std::span<const std::wstring_view> arguments) {
+  if (arguments.size() != 5 || arguments[1] != L"--user" ||
+      arguments[3] != L"--port" || arguments[2].empty()) {
+    return std::unexpected(error(ExitCode::usage, ERROR_INVALID_PARAMETER,
+                                 L"Expected --user <account> --port <port>"));
+  }
+  auto port = parse_port(arguments[4]);
+  if (!port) {
+    return std::unexpected(port.error());
+  }
+  return UserPort{std::wstring(arguments[2]), *port};
+}
+
 void print_usage() {
   std::wcerr << L"Usage:\n"
-             << L"  wfp-tool apply --config <path>\n"
-             << L"  wfp-tool verify --config <path>\n"
-             << L"  wfp-tool remove --config <path>\n"
-             << L"  wfp-tool clear --user <account>\n"
+             << L"  wfp-tool apply --user <account> --port <port>\n"
+             << L"  wfp-tool verify --user <account> --port <port>\n"
+             << L"  wfp-tool remove --user <account>\n"
              << L"  wfp-tool list --user <account>\n";
 }
 
@@ -1216,146 +1227,39 @@ int finish(Result<void> result, std::wstring_view success_message) {
 
 } // namespace
 
-Result<Config> parse_config(std::string_view text) {
-  Config config{};
-  std::string section;
-  bool account_seen{};
-  bool version_seen{};
-  std::size_t line_start{};
-  while (line_start <= text.size()) {
-    const std::size_t line_end = text.find('\n', line_start);
-    std::string_view line =
-        trim(text.substr(line_start, line_end == std::string_view::npos
-                                         ? std::string_view::npos
-                                         : line_end - line_start));
-    if (!line.empty() && line.back() == '\r') {
-      line.remove_suffix(1);
-    }
-    if (!line.empty() && line.front() != '#' && line.front() != ';') {
-      if (line.front() == '[' && line.back() == ']') {
-        section = ascii_lower(trim(line.substr(1, line.size() - 2)));
-      } else {
-        const std::size_t equals = line.find('=');
-        if (equals == std::string_view::npos || equals == 0) {
-          return std::unexpected(
-              error(ExitCode::usage_or_config, ERROR_INVALID_DATA,
-                    L"Configuration lines must use key=value"));
-        }
-        const std::string_view key = trim(line.substr(0, equals));
-        const std::string_view value = trim(line.substr(equals + 1));
-        if (section == "policy") {
-          const std::string lowered_key = ascii_lower(key);
-          if (lowered_key == "account") {
-            if (account_seen) {
-              return std::unexpected(error(ExitCode::usage_or_config,
-                                           ERROR_DUP_NAME,
-                                           L"Duplicate [policy] account"));
-            }
-            auto account = utf8_to_wide(value);
-            if (!account || account->empty()) {
-              return std::unexpected(
-                  account ? error(ExitCode::usage_or_config, ERROR_INVALID_DATA,
-                                  L"[policy] account must not be empty")
-                          : account.error());
-            }
-            config.account = std::move(*account);
-            account_seen = true;
-          } else if (lowered_key == "policy_version") {
-            if (version_seen) {
-              return std::unexpected(
-                  error(ExitCode::usage_or_config, ERROR_DUP_NAME,
-                        L"Duplicate [policy] policy_version"));
-            }
-            auto version = parse_version(value);
-            if (!version) {
-              return std::unexpected(version.error());
-            }
-            config.policy_version = *version;
-            version_seen = true;
-          }
-        } else if (section == "wfp-allow") {
-          auto endpoint = parse_endpoint(key, value);
-          if (!endpoint) {
-            return std::unexpected(endpoint.error());
-          }
-          if (std::any_of(config.allow.begin(), config.allow.end(),
-                          [&](const Config::Endpoint &existing) {
-                            return same_endpoint(existing, *endpoint);
-                          })) {
-            return std::unexpected(error(ExitCode::usage_or_config,
-                                         ERROR_DUP_NAME,
-                                         L"Duplicate [wfp-allow] endpoint"));
-          }
-          config.allow.push_back(*endpoint);
-        }
-      }
-    }
-    if (line_end == std::string_view::npos) {
-      break;
-    }
-    line_start = line_end + 1;
-  }
-  auto valid = validate_config(config);
-  if (!valid) {
-    return std::unexpected(valid.error());
-  }
-  return config;
-}
-
-Result<Config> load_config(const std::filesystem::path &path) {
-  std::ifstream file(path, std::ios::binary);
-  if (!file) {
-    return std::unexpected(error(ExitCode::usage_or_config,
-                                 static_cast<std::uint32_t>(GetLastError()),
-                                 L"Open configuration: " + path.wstring()));
-  }
-  std::ostringstream text;
-  text << file.rdbuf();
-  if (!file.good() && !file.eof()) {
-    return std::unexpected(error(ExitCode::usage_or_config, ERROR_READ_FAULT,
-                                 L"Read configuration: " + path.wstring()));
-  }
-  return parse_config(text.str());
-}
-
 int run(std::span<const std::wstring_view> arguments) {
   if (arguments.empty()) {
     print_usage();
-    return static_cast<int>(ExitCode::usage_or_config);
+    return static_cast<int>(ExitCode::usage);
   }
-  const auto command = arguments.front();
-  if (command == L"apply" || command == L"verify" || command == L"remove") {
-    if (arguments.size() != 3 || arguments[1] != L"--config") {
+  if (arguments[0] == L"apply" || arguments[0] == L"verify") {
+    auto input = parse_user_port(arguments);
+    if (!input) {
       print_usage();
-      return static_cast<int>(ExitCode::usage_or_config);
+      return static_cast<int>(input.error().exit_code);
     }
-    const auto config = std::filesystem::path(arguments[2]);
-    if (command == L"apply") {
-      return finish(apply_command(config),
-                    L"wfp-tool policy applied and verified.");
+    if (arguments[0] == L"apply") {
+      return finish(apply_command(input->user, input->port),
+                    L"wfp-tool loopback policy applied and verified.");
     }
-    if (command == L"verify") {
-      return finish(verify_command(config),
-                    L"wfp-tool policy matches the configuration.");
-    }
-    return finish(remove_command(config), L"wfp-tool policy removed.");
+    return finish(
+        verify_command(input->user, input->port),
+        L"wfp-tool loopback policy matches the requested user and port.");
   }
-  if (command == L"list") {
-    if (arguments.size() != 3 || arguments[1] != L"--user") {
+  if (arguments[0] == L"remove" || arguments[0] == L"list") {
+    if (arguments.size() != 3 || arguments[1] != L"--user" ||
+        arguments[2].empty()) {
       print_usage();
-      return static_cast<int>(ExitCode::usage_or_config);
+      return static_cast<int>(ExitCode::usage);
+    }
+    if (arguments[0] == L"remove") {
+      return finish(remove_command(arguments[2]),
+                    L"wfp-tool loopback policy removed.");
     }
     return finish(list_command(arguments[2]), L"wfp-tool filters listed.");
   }
-  if (command == L"clear") {
-    if (arguments.size() != 3 || arguments[1] != L"--user") {
-      print_usage();
-      return static_cast<int>(ExitCode::usage_or_config);
-    }
-    return finish(clear_command(arguments[2]), L"wfp-tool filters cleared.");
-  }
   print_usage();
-  return static_cast<int>(ExitCode::usage_or_config);
+  return static_cast<int>(ExitCode::usage);
 }
 
 } // namespace sandbox_network

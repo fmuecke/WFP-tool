@@ -1,10 +1,27 @@
+# Copyright (C) 2026 Florian Mücke
+# SPDX-License-Identifier: GPL-3.0-only
+# Project: https://github.com/fmuecke/WFP-tool.git
+
+
 [CmdletBinding()]
 param(
     [ValidateSet('Debug', 'Release')]
-    [string]$Configuration = 'Release'
+    [string]$Configuration = 'Release',
+
+    [string]$IntegrationUser,
+
+    [string]$IntegrationOtherUser
 )
 
 $ErrorActionPreference = 'Stop'
+
+if ($IntegrationUser -or $IntegrationOtherUser) {
+    if (-not $IntegrationUser -or -not $IntegrationOtherUser) {
+        throw '-IntegrationUser and -IntegrationOtherUser must be supplied together.'
+    }
+    $env:WFP_TOOL_INTEGRATION_USER = $IntegrationUser
+    $env:WFP_TOOL_INTEGRATION_OTHER_USER = $IntegrationOtherUser
+}
 
 $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
 if (-not (Test-Path -LiteralPath $vswhere)) {
