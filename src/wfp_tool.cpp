@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // Project : https: // github.com/fmuecke/WFP-tool.git
 
-#include "sandbox_network.h"
+#include "wfp_tool.h"
 
 #include <winsock2.h>
 #include <windows.h>
@@ -29,7 +29,7 @@
 #include <utility>
 #include <vector>
 
-namespace sandbox_network::detail {
+namespace wfp_tool::detail {
 
 bool same_access_control_descriptor(PSECURITY_DESCRIPTOR actual,
                                     PSECURITY_DESCRIPTOR expected) {
@@ -136,9 +136,9 @@ bool same_wfp_object_access_control_descriptor(PSECURITY_DESCRIPTOR actual,
   return true;
 }
 
-} // namespace sandbox_network::detail
+} // namespace wfp_tool::detail
 
-namespace sandbox_network {
+namespace wfp_tool {
 namespace {
 
 constexpr GUID provider_key{0x9b2365a6,
@@ -1262,4 +1262,4 @@ int run(std::span<const std::wstring_view> arguments) {
   return static_cast<int>(ExitCode::usage);
 }
 
-} // namespace sandbox_network
+} // namespace wfp_tool

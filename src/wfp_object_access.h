@@ -6,7 +6,7 @@
 
 #include <windows.h>
 
-namespace sandbox_network::detail {
+namespace wfp_tool::detail {
 
 // WFP policy objects are administrative settings. P protects this DACL from
 // inherited engine ACEs, leaving only SYSTEM and Administrators able to alter
@@ -17,4 +17,4 @@ inline constexpr wchar_t expected_wfp_object_dacl_sddl[] =
 bool same_access_control_descriptor(PSECURITY_DESCRIPTOR actual,
                                     PSECURITY_DESCRIPTOR expected);
 
-} // namespace sandbox_network::detail
+} // namespace wfp_tool::detail

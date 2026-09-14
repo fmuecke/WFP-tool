@@ -11,7 +11,7 @@ if(NOT WIN32)
 endif()
 
 add_library(wfp_tool_lib STATIC
-    src/sandbox_network.cpp
+    src/wfp_tool.cpp
 )
 target_include_directories(wfp_tool_lib PUBLIC src)
 target_compile_features(wfp_tool_lib PUBLIC cxx_std_23)

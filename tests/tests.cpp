@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // Project: https://github.com/fmuecke/WFP-tool.git
 
-#include "sandbox_network.h"
+#include "wfp_tool.h"
 #include "wfp_object_access.h"
 
 #include <cstdlib>
@@ -25,49 +25,47 @@ void check(bool condition, std::string_view message) {
 }
 
 void cli_tests() {
-  check(sandbox_network::run({}) ==
-            static_cast<int>(sandbox_network::ExitCode::usage),
+  check(wfp_tool::run({}) == static_cast<int>(wfp_tool::ExitCode::usage),
         "empty CLI is a usage error");
 
   constexpr std::wstring_view unknown[] = {L"unknown"};
-  check(sandbox_network::run(unknown) ==
-            static_cast<int>(sandbox_network::ExitCode::usage),
+  check(wfp_tool::run(unknown) == static_cast<int>(wfp_tool::ExitCode::usage),
         "unknown command is a usage error");
 
   for (const auto command : {L"apply", L"verify"}) {
     const std::wstring_view missing_port[] = {command, L"--user",
                                               L"AgentSandbox"};
-    check(sandbox_network::run(missing_port) ==
-              static_cast<int>(sandbox_network::ExitCode::usage),
+    check(wfp_tool::run(missing_port) ==
+              static_cast<int>(wfp_tool::ExitCode::usage),
           "apply and verify require a user and port");
 
     const std::wstring_view config_file[] = {command, L"--config",
                                              L"policy.ini"};
-    check(sandbox_network::run(config_file) ==
-              static_cast<int>(sandbox_network::ExitCode::usage),
+    check(wfp_tool::run(config_file) ==
+              static_cast<int>(wfp_tool::ExitCode::usage),
           "configuration files are not accepted");
   }
 
   constexpr std::wstring_view remove_config[] = {L"remove", L"--config",
                                                  L"policy.ini"};
-  check(sandbox_network::run(remove_config) ==
-            static_cast<int>(sandbox_network::ExitCode::usage),
+  check(wfp_tool::run(remove_config) ==
+            static_cast<int>(wfp_tool::ExitCode::usage),
         "remove does not accept a configuration file");
 
   constexpr std::wstring_view missing_remove_user[] = {L"remove"};
-  check(sandbox_network::run(missing_remove_user) ==
-            static_cast<int>(sandbox_network::ExitCode::usage),
+  check(wfp_tool::run(missing_remove_user) ==
+            static_cast<int>(wfp_tool::ExitCode::usage),
         "remove requires a user");
 
   constexpr std::wstring_view invalid_list[] = {L"list"};
-  check(sandbox_network::run(invalid_list) ==
-            static_cast<int>(sandbox_network::ExitCode::usage),
+  check(wfp_tool::run(invalid_list) ==
+            static_cast<int>(wfp_tool::ExitCode::usage),
         "list requires a user");
 
   constexpr std::wstring_view removed_clear[] = {L"clear", L"--user",
                                                  L"AgentSandbox"};
-  check(sandbox_network::run(removed_clear) ==
-            static_cast<int>(sandbox_network::ExitCode::usage),
+  check(wfp_tool::run(removed_clear) ==
+            static_cast<int>(wfp_tool::ExitCode::usage),
         "clear is no longer an alias for remove");
 }
 
@@ -84,7 +82,7 @@ void wfp_object_access_control_tests() {
   // Keep the test's independent expected value in sync with the administrative
   // policy contract: P prevents inherited WFP engine ACEs from widening it.
   constexpr wchar_t expected_sddl[] = L"D:P(A;;GA;;;SY)(A;;GA;;;BA)";
-  check(std::wcscmp(sandbox_network::detail::expected_wfp_object_dacl_sddl,
+  check(std::wcscmp(wfp_tool::detail::expected_wfp_object_dacl_sddl,
                     expected_sddl) == 0,
         "WFP objects grant full control only to SYSTEM and Administrators");
 
@@ -94,8 +92,7 @@ void wfp_object_access_control_tests() {
   if (!expected) {
     return;
   }
-  check(sandbox_network::detail::same_access_control_descriptor(expected,
-                                                                expected),
+  check(wfp_tool::detail::same_access_control_descriptor(expected, expected),
         "the expected WFP object DACL matches itself");
 
   // This intentionally grants Everyone read access and must not match the
@@ -107,8 +104,7 @@ void wfp_object_access_control_tests() {
   if (!broader) {
     return;
   }
-  check(!sandbox_network::detail::same_access_control_descriptor(broader,
-                                                                 expected),
+  check(!wfp_tool::detail::same_access_control_descriptor(broader, expected),
         "a WFP object DACL that grants Everyone access is rejected");
 }
 

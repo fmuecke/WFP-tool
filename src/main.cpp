@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // Project : https: // github.com/fmuecke/WFP-tool.git
 
-#include "sandbox_network.h"
+#include "wfp_tool.h"
 
 #include <string_view>
 #include <vector>
@@ -13,5 +13,5 @@ int wmain(int argc, wchar_t **argv) {
   for (int index = 1; index < argc; ++index) {
     arguments.emplace_back(argv[index]);
   }
-  return sandbox_network::run(arguments);
+  return wfp_tool::run(arguments);
 }

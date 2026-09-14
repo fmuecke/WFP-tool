@@ -8,7 +8,7 @@
 #include <span>
 #include <string_view>
 
-namespace sandbox_network {
+namespace wfp_tool {
 
 enum class ExitCode : int {
   success = 0,
@@ -20,4 +20,4 @@ enum class ExitCode : int {
 
 int run(std::span<const std::wstring_view> arguments);
 
-} // namespace sandbox_network
+} // namespace wfp_tool

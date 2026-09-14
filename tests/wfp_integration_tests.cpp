@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // Project: https://github.com/fmuecke/WFP-tool.git
 
-#include "sandbox_network.h"
+#include "wfp_tool.h"
 
 #include <windows.h>
 #include <fwpmtypes.h>
@@ -116,13 +116,13 @@ int run_user_port(std::wstring_view command, std::wstring_view user,
                   std::wstring_view port) {
   const std::array arguments{command, std::wstring_view(L"--user"), user,
                              std::wstring_view(L"--port"), port};
-  return sandbox_network::run(arguments);
+  return wfp_tool::run(arguments);
 }
 
 int run_remove(std::wstring_view user) {
   const std::array arguments{std::wstring_view(L"remove"),
                              std::wstring_view(L"--user"), user};
-  return sandbox_network::run(arguments);
+  return wfp_tool::run(arguments);
 }
 
 class ScopedWcerrCapture {
@@ -151,24 +151,24 @@ bool expect_verify_failure(std::wstring_view user, std::wstring_view port) {
     exit_code = run_user_port(L"verify", user, port);
     diagnostic = errors.str();
   }
-  check(exit_code == static_cast<int>(sandbox_network::ExitCode::verification),
+  check(exit_code == static_cast<int>(wfp_tool::ExitCode::verification),
         "verify rejects the tampered WFP object");
-  if (exit_code != static_cast<int>(sandbox_network::ExitCode::verification)) {
+  if (exit_code != static_cast<int>(wfp_tool::ExitCode::verification)) {
     std::wcerr << L"Unexpected verify result (" << exit_code << L"): "
                << diagnostic;
   }
-  return exit_code == static_cast<int>(sandbox_network::ExitCode::verification);
+  return exit_code == static_cast<int>(wfp_tool::ExitCode::verification);
 }
 
 bool reapply_and_verify(std::wstring_view user, std::wstring_view port) {
   const int apply = run_user_port(L"apply", user, port);
-  check(apply == static_cast<int>(sandbox_network::ExitCode::success),
+  check(apply == static_cast<int>(wfp_tool::ExitCode::success),
         "apply restores the expected policy");
   const int verify = run_user_port(L"verify", user, port);
-  check(verify == static_cast<int>(sandbox_network::ExitCode::success),
+  check(verify == static_cast<int>(wfp_tool::ExitCode::success),
         "verify accepts the restored policy");
-  return apply == static_cast<int>(sandbox_network::ExitCode::success) &&
-         verify == static_cast<int>(sandbox_network::ExitCode::success);
+  return apply == static_cast<int>(wfp_tool::ExitCode::success) &&
+         verify == static_cast<int>(wfp_tool::ExitCode::success);
 }
 
 std::vector<GUID> filter_keys(HANDLE engine) {
@@ -220,8 +220,7 @@ void lifecycle_tests(HANDLE engine, std::wstring_view user) {
     check(persistent, "each wfp-tool filter is persistent");
   }
 
-  check(run_remove(user) ==
-            static_cast<int>(sandbox_network::ExitCode::success),
+  check(run_remove(user) == static_cast<int>(wfp_tool::ExitCode::success),
         "remove deletes the disposable-account policy");
   check(filter_keys(engine).empty(), "remove leaves no wfp-tool filters");
 
@@ -297,15 +296,14 @@ void idempotence_and_isolation_tests(std::wstring_view first_user,
   check(reapply_and_verify(second_user, second_port),
         "apply creates an independent second account policy");
   check(run_user_port(L"verify", first_user, replacement_port) ==
-            static_cast<int>(sandbox_network::ExitCode::success),
+            static_cast<int>(wfp_tool::ExitCode::success),
         "the first account policy remains valid after applying the second");
 
-  check(run_remove(first_user) ==
-            static_cast<int>(sandbox_network::ExitCode::success),
+  check(run_remove(first_user) == static_cast<int>(wfp_tool::ExitCode::success),
         "remove deletes only the first account policy");
   expect_verify_failure(first_user, replacement_port);
   check(run_user_port(L"verify", second_user, second_port) ==
-            static_cast<int>(sandbox_network::ExitCode::success),
+            static_cast<int>(wfp_tool::ExitCode::success),
         "the second account policy remains valid after removing the first");
 }
 
@@ -332,11 +330,10 @@ int wmain(int argc, wchar_t **argv) {
     return EXIT_FAILURE;
   }
   Cleanup cleanup{first_user, second_user};
-  check(run_remove(first_user) ==
-            static_cast<int>(sandbox_network::ExitCode::success),
+  check(run_remove(first_user) == static_cast<int>(wfp_tool::ExitCode::success),
         "remove any prior first-account policy");
   check(run_remove(second_user) ==
-            static_cast<int>(sandbox_network::ExitCode::success),
+            static_cast<int>(wfp_tool::ExitCode::success),
         "remove any prior second-account policy");
 
   Engine engine;
@@ -371,12 +368,11 @@ int wmain(int argc, wchar_t **argv) {
     return EXIT_FAILURE;
   }
 
-  check(run_remove(first_user) ==
-            static_cast<int>(sandbox_network::ExitCode::success),
+  check(run_remove(first_user) == static_cast<int>(wfp_tool::ExitCode::success),
         "remove first-account DACL test policy");
   idempotence_and_isolation_tests(first_user, second_user);
   check(run_remove(second_user) ==
-            static_cast<int>(sandbox_network::ExitCode::success),
+            static_cast<int>(wfp_tool::ExitCode::success),
         "remove second-account policy");
   if (failures != 0) {
     return EXIT_FAILURE;
