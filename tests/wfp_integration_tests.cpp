@@ -14,6 +14,7 @@
 #include <sddl.h>
 #include <sstream>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 #include <windows.h>
@@ -231,6 +232,91 @@ std::vector<GUID> filter_keys(HANDLE engine)
     return keys;
 }
 
+std::vector<BYTE> account_sid(std::wstring_view user)
+{
+    DWORD sid_size {};
+    DWORD domain_size {};
+    SID_NAME_USE use {};
+    LookupAccountNameW(
+        nullptr, std::wstring(user).c_str(), nullptr, &sid_size, nullptr, &domain_size, &use);
+    if (GetLastError() != ERROR_INSUFFICIENT_BUFFER || sid_size == 0)
+    {
+        check(false, "resolve disposable-account SID size");
+        return {};
+    }
+    std::vector<BYTE> sid(sid_size);
+    std::wstring domain(domain_size, L'\0');
+    if (!LookupAccountNameW(nullptr,
+            std::wstring(user).c_str(),
+            sid.data(),
+            &sid_size,
+            domain.data(),
+            &domain_size,
+            &use))
+    {
+        check(false, "resolve disposable-account SID");
+        return {};
+    }
+    sid.resize(sid_size);
+    return sid;
+}
+
+bool filter_container_grants_enumeration(HANDLE engine, std::wstring_view user)
+{
+    const auto sid = account_sid(user);
+    if (sid.empty())
+    {
+        return false;
+    }
+    PSECURITY_DESCRIPTOR descriptor {};
+    const DWORD read = FwpmFilterGetSecurityInfoByKey0(engine,
+        nullptr,
+        DACL_SECURITY_INFORMATION,
+        nullptr,
+        nullptr,
+        nullptr,
+        nullptr,
+        &descriptor);
+    if (read != ERROR_SUCCESS)
+    {
+        check(false, "read WFP filter-container DACL");
+        return false;
+    }
+    BOOL present {};
+    BOOL defaulted {};
+    PACL dacl {};
+    const bool valid =
+        GetSecurityDescriptorDacl(descriptor, &present, &dacl, &defaulted) && present && dacl;
+    bool grants_enumeration {};
+    if (valid)
+    {
+        for (DWORD index = 0; index < dacl->AceCount; ++index)
+        {
+            void* entry {};
+            if (!GetAce(dacl, index, &entry))
+            {
+                check(false, "read WFP filter-container ACE");
+                break;
+            }
+            const auto* ace = static_cast<const ACCESS_ALLOWED_ACE*>(entry);
+            if (ace->Header.AceType == ACCESS_ALLOWED_ACE_TYPE && ace->Header.AceFlags == 0 &&
+                ace->Mask == FWPM_ACTRL_ENUM &&
+                EqualSid(const_cast<PSID>(static_cast<const void*>(&ace->SidStart)),
+                    const_cast<BYTE*>(sid.data())))
+            {
+                grants_enumeration = true;
+                break;
+            }
+        }
+    }
+    else
+    {
+        check(false, "WFP filter container has a DACL");
+    }
+    FwpmFreeMemory0(reinterpret_cast<void**>(&descriptor));
+    return grants_enumeration;
+}
+
 void lifecycle_tests(HANDLE engine, std::wstring_view user)
 {
     check(reapply_and_verify(user, first_port),
@@ -253,6 +339,8 @@ void lifecycle_tests(HANDLE engine, std::wstring_view user)
     check(run_remove(user) == static_cast<int>(user_net_lock::ExitCode::success),
         "remove deletes the disposable-account policy");
     check(filter_keys(engine).empty(), "remove leaves no user-net-lock filters");
+    check(!filter_container_grants_enumeration(engine, user),
+        "remove revokes the account's WFP filter-enumeration access");
 
     FWPM_PROVIDER0* provider {};
     const DWORD provider_result = FwpmProviderGetByKey0(engine, &provider_key, &provider);
@@ -343,6 +431,32 @@ void idempotence_and_isolation_tests(std::wstring_view first_user, std::wstring_
         "the second account policy remains valid after removing the first");
 }
 
+void concurrent_apply_tests(std::wstring_view first_user, std::wstring_view second_user)
+{
+    check(run_remove(first_user) == static_cast<int>(user_net_lock::ExitCode::success),
+        "remove prior first-account policy before concurrent apply");
+    check(run_remove(second_user) == static_cast<int>(user_net_lock::ExitCode::success),
+        "remove prior second-account policy before concurrent apply");
+
+    int first_result {};
+    int second_result {};
+    std::thread first([&] { first_result = run_user_port(L"apply", first_user, first_port); });
+    std::thread second([&] { second_result = run_user_port(L"apply", second_user, second_port); });
+    first.join();
+    second.join();
+
+    check(first_result == static_cast<int>(user_net_lock::ExitCode::success),
+        "concurrent apply succeeds for the first account");
+    check(second_result == static_cast<int>(user_net_lock::ExitCode::success),
+        "concurrent apply succeeds for the second account");
+    check(run_user_port(L"verify", first_user, first_port) ==
+              static_cast<int>(user_net_lock::ExitCode::success),
+        "first account retains shared-infrastructure status access after concurrent apply");
+    check(run_user_port(L"verify", second_user, second_port) ==
+              static_cast<int>(user_net_lock::ExitCode::success),
+        "second account retains shared-infrastructure status access after concurrent apply");
+}
+
 } // namespace
 
 int wmain(int argc, wchar_t** argv)
@@ -414,6 +528,7 @@ int wmain(int argc, wchar_t** argv)
     check(run_remove(first_user) == static_cast<int>(user_net_lock::ExitCode::success),
         "remove first-account DACL test policy");
     idempotence_and_isolation_tests(first_user, second_user);
+    concurrent_apply_tests(first_user, second_user);
     check(run_remove(second_user) == static_cast<int>(user_net_lock::ExitCode::success),
         "remove second-account policy");
     if (failures != 0)

@@ -11,14 +11,17 @@ removes a persistent WFP policy:
 
 It does not read configuration files, install a proxy, download software,
 resolve hostnames, or interpret an allowlist. It protects its WFP provider,
-sublayer, and filters with the fixed `SYSTEM`/Administrators DACL and verifies
-that DACL. The proxy configurator owns the remaining concerns;
+sublayer, and filters from modification by every managed account while granting
+each managed account read-only access to its own policy status. The proxy
+configurator owns the remaining concerns;
 `agent-win-sandbox` calls this tool only after the loopback proxy is running
 and healthy.
 
 ## Commands
 
-All commands require an elevated Administrator session.
+`apply` and `remove` require an elevated Administrator session. A managed,
+non-administrator account may run `verify` and `list` only for itself. An
+administrator may inspect any managed account.
 
 ```text
 user-net-lock apply --user <account> --port <port>
@@ -32,6 +35,11 @@ installs the fixed loopback policy, and verifies it before reporting success.
 `remove` deletes only this tool's filters for the selected account. `list`
 prints those filters, including any stale loopback policy from a different
 port.
+
+The status ACL grants the managed account WFP read access and `READ_CONTROL`
+only. It grants no filter deletion, policy mutation, ownership, or DACL-change
+rights. A narrowly scoped filter-container enumeration ACE is also needed by
+the WFP API; enumeration returns only filters that the caller can read.
 
 The WFP `ALE_USER_ID` condition necessarily contains a security descriptor for
 the selected account SID; that is the Windows API representation of a
@@ -74,4 +82,8 @@ The same runner also launches a real traffic-enforcement test as the two
 disposable accounts. It proves the target account can use the configured IPv4
 and IPv6 loopback TCP proxy port, cannot use a different loopback port or TCP
 and UDP to a non-loopback address, and that the second account can still reach
-the non-loopback TCP and UDP listeners.
+the non-loopback TCP and UDP listeners. It also verifies that the target can
+list and verify its own installed policy without elevation, while the other
+standard account cannot inspect it. It also attempts to weaken the provider
+DACL through the target account's direct WFP API call and requires access to be
+denied.

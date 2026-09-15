@@ -9,6 +9,9 @@
 
 #include <iphlpapi.h>
 #include <lm.h>
+#include <fwpmtypes.h>
+#include <fwpmu.h>
+#include <sddl.h>
 #include <windows.h>
 
 #include <array>
@@ -29,6 +32,9 @@ constexpr std::wstring_view different_loopback_port = L"49156";
 constexpr std::wstring_view blocked_non_loopback_port = L"49157";
 constexpr std::wstring_view control_non_loopback_port = L"49158";
 constexpr wchar_t traffic_password[] = L"WfpTraffic-Test-2026!";
+constexpr GUID provider_key {
+    0x9b2365a6, 0xf9b9, 0x49f9, {0xab, 0xdb, 0x19, 0x65, 0x79, 0xb1, 0x48, 0x1c}
+};
 
 int failures {};
 
@@ -320,6 +326,117 @@ int launch_probe(std::wstring_view user, std::wstring_view password, std::wstrin
     return static_cast<int>(exit_code);
 }
 
+int launch_status_probe(std::wstring_view user, std::wstring_view password,
+    std::wstring_view command, std::wstring_view policy_user, std::wstring_view port = L"")
+{
+    std::array<wchar_t, MAX_PATH> executable {};
+    const DWORD executable_length =
+        GetModuleFileNameW(nullptr, executable.data(), executable.size());
+    if (executable_length == 0 || executable_length == executable.size())
+    {
+        return EXIT_FAILURE;
+    }
+    std::wstring line = L"\"" + std::wstring(executable.data(), executable_length) +
+                        L"\" --status-probe " + std::wstring(command) + L" " +
+                        std::wstring(policy_user);
+    if (!port.empty())
+    {
+        line += L" " + std::wstring(port);
+    }
+    std::vector<wchar_t> mutable_line(line.begin(), line.end());
+    mutable_line.push_back(L'\0');
+    STARTUPINFOW startup {};
+    startup.cb = sizeof(startup);
+    PROCESS_INFORMATION process {};
+    if (!CreateProcessWithLogonW(std::wstring(user).c_str(),
+            L".",
+            std::wstring(password).c_str(),
+            LOGON_WITH_PROFILE,
+            nullptr,
+            mutable_line.data(),
+            CREATE_NO_WINDOW,
+            nullptr,
+            nullptr,
+            &startup,
+            &process))
+    {
+        return EXIT_FAILURE;
+    }
+    WaitForSingleObject(process.hProcess, INFINITE);
+    DWORD exit_code {EXIT_FAILURE};
+    GetExitCodeProcess(process.hProcess, &exit_code);
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+    return static_cast<int>(exit_code);
+}
+
+int launch_mutation_probe(std::wstring_view user, std::wstring_view password)
+{
+    std::array<wchar_t, MAX_PATH> executable {};
+    const DWORD executable_length =
+        GetModuleFileNameW(nullptr, executable.data(), executable.size());
+    if (executable_length == 0 || executable_length == executable.size())
+    {
+        return EXIT_FAILURE;
+    }
+    std::wstring line =
+        L"\"" + std::wstring(executable.data(), executable_length) + L"\" --mutation-probe";
+    std::vector<wchar_t> mutable_line(line.begin(), line.end());
+    mutable_line.push_back(L'\0');
+    STARTUPINFOW startup {};
+    startup.cb = sizeof(startup);
+    PROCESS_INFORMATION process {};
+    if (!CreateProcessWithLogonW(std::wstring(user).c_str(),
+            L".",
+            std::wstring(password).c_str(),
+            LOGON_WITH_PROFILE,
+            nullptr,
+            mutable_line.data(),
+            CREATE_NO_WINDOW,
+            nullptr,
+            nullptr,
+            &startup,
+            &process))
+    {
+        return EXIT_FAILURE;
+    }
+    WaitForSingleObject(process.hProcess, INFINITE);
+    DWORD exit_code {EXIT_FAILURE};
+    GetExitCodeProcess(process.hProcess, &exit_code);
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+    return static_cast<int>(exit_code);
+}
+
+int mutation_probe()
+{
+    HANDLE engine {};
+    if (FwpmEngineOpen0(nullptr, RPC_C_AUTHN_WINNT, nullptr, nullptr, &engine) != ERROR_SUCCESS)
+    {
+        return EXIT_FAILURE;
+    }
+    PSECURITY_DESCRIPTOR descriptor {};
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            L"D:(A;;GR;;;WD)", SDDL_REVISION_1, &descriptor, nullptr))
+    {
+        FwpmEngineClose0(engine);
+        return EXIT_FAILURE;
+    }
+    BOOL present {};
+    BOOL defaulted {};
+    PACL dacl {};
+    const bool has_dacl =
+        GetSecurityDescriptorDacl(descriptor, &present, &dacl, &defaulted) && present && dacl;
+    const DWORD result =
+        has_dacl
+            ? FwpmProviderSetSecurityInfoByKey0(
+                  engine, &provider_key, DACL_SECURITY_INFORMATION, nullptr, nullptr, dacl, nullptr)
+            : ERROR_INVALID_DATA;
+    LocalFree(descriptor);
+    FwpmEngineClose0(engine);
+    return result == ERROR_ACCESS_DENIED ? EXIT_SUCCESS : EXIT_FAILURE;
+}
+
 int run_user_port(std::wstring_view command, std::wstring_view user, std::wstring_view port)
 {
     const std::array arguments {
@@ -367,6 +484,17 @@ void traffic_enforcement_tests(std::wstring_view target, std::wstring_view other
     check(run_user_port(L"apply", target, proxy_port) ==
               static_cast<int>(user_net_lock::ExitCode::success),
         "apply target loopback policy");
+    check(launch_status_probe(target, traffic_password, L"verify", target, proxy_port) ==
+              static_cast<int>(user_net_lock::ExitCode::success),
+        "managed standard account verifies its own policy");
+    check(launch_status_probe(target, traffic_password, L"list", target) ==
+              static_cast<int>(user_net_lock::ExitCode::success),
+        "managed standard account lists its own filters");
+    check(launch_status_probe(other, traffic_password, L"verify", target, proxy_port) ==
+              static_cast<int>(user_net_lock::ExitCode::precondition),
+        "another standard account cannot inspect the target policy");
+    check(launch_mutation_probe(target, traffic_password) == EXIT_SUCCESS,
+        "managed standard account cannot weaken the provider DACL through the WFP API");
 
     Winsock winsock;
     check(winsock.available(), "start Winsock");
@@ -497,6 +625,32 @@ int wmain(int argc, wchar_t** argv)
     if (argc == 5 && std::wstring_view(argv[1]) == L"--traffic-probe")
     {
         return winsock.available() ? socket_probe(argv[2], argv[3], argv[4]) : EXIT_FAILURE;
+    }
+    if (argc >= 4 && std::wstring_view(argv[1]) == L"--status-probe")
+    {
+        if (std::wstring_view(argv[2]) == L"verify" && argc == 5)
+        {
+            const std::array arguments {
+                std::wstring_view(L"verify"),
+                std::wstring_view(L"--user"),
+                std::wstring_view(argv[3]),
+                std::wstring_view(L"--port"),
+                std::wstring_view(argv[4])
+            };
+            return user_net_lock::run(arguments);
+        }
+        if (std::wstring_view(argv[2]) == L"list" && argc == 4)
+        {
+            const std::array arguments {
+                std::wstring_view(L"list"), std::wstring_view(L"--user"), std::wstring_view(argv[3])
+            };
+            return user_net_lock::run(arguments);
+        }
+        return EXIT_FAILURE;
+    }
+    if (argc == 2 && std::wstring_view(argv[1]) == L"--mutation-probe")
+    {
+        return mutation_probe();
     }
     if (argc != 3)
     {

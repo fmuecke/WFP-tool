@@ -10,10 +10,13 @@ namespace user_net_lock::detail
 {
 
 // WFP policy objects are administrative settings. P protects this DACL from
-// inherited engine ACEs, leaving only SYSTEM and Administrators able to alter
-// or delete the provider, sublayer, and filters.
-inline constexpr wchar_t expected_wfp_object_dacl_sddl[] = L"D:P(A;;GA;;;SY)(A;;GA;;;BA)";
+// inherited engine ACEs. Each managed account receives a separate read-only
+// ACE at installation time; only SYSTEM and Administrators receive full
+// control.
+inline constexpr wchar_t administrative_wfp_object_dacl_sddl[] = L"D:P(A;;GA;;;SY)(A;;GA;;;BA)";
 
 bool same_access_control_descriptor(PSECURITY_DESCRIPTOR actual, PSECURITY_DESCRIPTOR expected);
+
+bool has_protected_dacl(PSECURITY_DESCRIPTOR descriptor);
 
 } // namespace user_net_lock::detail

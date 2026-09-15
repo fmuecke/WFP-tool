@@ -32,6 +32,19 @@
 namespace user_net_lock::detail
 {
 
+DWORD normalized_wfp_access_mask(DWORD mask)
+{
+    if ((mask & GENERIC_ALL) != 0)
+    {
+        mask = (mask & ~GENERIC_ALL) | FWPM_GENERIC_ALL;
+    }
+    if ((mask & GENERIC_READ) != 0)
+    {
+        mask = (mask & ~GENERIC_READ) | FWPM_GENERIC_READ;
+    }
+    return mask;
+}
+
 bool same_access_control_descriptor(PSECURITY_DESCRIPTOR actual, PSECURITY_DESCRIPTOR expected)
 {
     if (!actual || !expected || !IsValidSecurityDescriptor(actual) ||
@@ -124,18 +137,14 @@ bool same_wfp_object_access_control_descriptor(
     {
         const PSID expected_sid =
             const_cast<PSID>(static_cast<const void*>(&expected_ace->SidStart));
-        DWORD expected_mask = expected_ace->Mask;
-        if ((expected_mask & GENERIC_ALL) != 0)
-        {
-            expected_mask = (expected_mask & ~GENERIC_ALL) | FWPM_GENERIC_ALL;
-        }
+        const DWORD expected_mask = normalized_wfp_access_mask(expected_ace->Mask);
         bool found {};
         for (std::size_t index = 0; index < actual_aces.size(); ++index)
         {
             const ACCESS_ALLOWED_ACE* actual_ace = actual_aces[index];
             const PSID actual_sid =
                 const_cast<PSID>(static_cast<const void*>(&actual_ace->SidStart));
-            if (!matched[index] && actual_ace->Mask == expected_mask &&
+            if (!matched[index] && normalized_wfp_access_mask(actual_ace->Mask) == expected_mask &&
                 EqualSid(actual_sid, expected_sid))
             {
                 matched[index] = true;
@@ -149,6 +158,18 @@ bool same_wfp_object_access_control_descriptor(
         }
     }
     return true;
+}
+
+bool has_protected_dacl(PSECURITY_DESCRIPTOR descriptor)
+{
+    if (!descriptor || !IsValidSecurityDescriptor(descriptor))
+    {
+        return false;
+    }
+    SECURITY_DESCRIPTOR_CONTROL control {};
+    DWORD revision {};
+    return GetSecurityDescriptorControl(descriptor, &control, &revision) &&
+           (control & SE_DACL_PROTECTED) != 0;
 }
 
 } // namespace user_net_lock::detail
@@ -216,6 +237,44 @@ struct Engine
     }
 };
 
+class SharedInfrastructureMutex
+{
+  public:
+    explicit SharedInfrastructureMutex(HANDLE value) : value_(value) {}
+
+    ~SharedInfrastructureMutex()
+    {
+        if (value_)
+        {
+            ReleaseMutex(value_);
+            CloseHandle(value_);
+        }
+    }
+
+    SharedInfrastructureMutex(const SharedInfrastructureMutex&) = delete;
+    SharedInfrastructureMutex& operator=(const SharedInfrastructureMutex&) = delete;
+    SharedInfrastructureMutex(SharedInfrastructureMutex&& other) noexcept
+        : value_(std::exchange(other.value_, nullptr))
+    {
+    }
+    SharedInfrastructureMutex& operator=(SharedInfrastructureMutex&& other) noexcept
+    {
+        if (this != &other)
+        {
+            if (value_)
+            {
+                ReleaseMutex(value_);
+                CloseHandle(value_);
+            }
+            value_ = std::exchange(other.value_, nullptr);
+        }
+        return *this;
+    }
+
+  private:
+    HANDLE value_ {};
+};
+
 struct Rule
 {
     const GUID* layer;
@@ -268,6 +327,38 @@ Error win32_error(ExitCode exit_code, DWORD code, std::wstring_view operation)
         code,
         std::wstring(operation) + L": " + system_message(code) + L" (" + std::to_wstring(code) +
             L")");
+}
+
+Result<SharedInfrastructureMutex> lock_shared_infrastructure()
+{
+    // The mutex is global so elevated applies from different interactive sessions
+    // cannot snapshot and replace the provider/sublayer DACL concurrently.
+    constexpr wchar_t mutex_name[] = L"Global\\user-net-lock-shared-infrastructure-v1";
+    constexpr wchar_t mutex_dacl[] = L"D:P(A;;GA;;;SY)(A;;GA;;;BA)";
+    PSECURITY_DESCRIPTOR descriptor {};
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            mutex_dacl, SDDL_REVISION_1, &descriptor, nullptr))
+    {
+        return std::unexpected(
+            win32_error(ExitCode::wfp, GetLastError(), L"Build shared-infrastructure mutex DACL"));
+    }
+    LocalMemory memory(descriptor, LocalFree);
+    SECURITY_ATTRIBUTES attributes {sizeof(attributes), descriptor, FALSE};
+    HANDLE mutex = CreateMutexW(&attributes, FALSE, mutex_name);
+    if (!mutex)
+    {
+        return std::unexpected(
+            win32_error(ExitCode::wfp, GetLastError(), L"Create shared-infrastructure mutex"));
+    }
+    const DWORD wait = WaitForSingleObject(mutex, INFINITE);
+    if (wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED)
+    {
+        return SharedInfrastructureMutex(mutex);
+    }
+    const DWORD code = wait == WAIT_FAILED ? GetLastError() : ERROR_GEN_FAILURE;
+    CloseHandle(mutex);
+    return std::unexpected(
+        win32_error(ExitCode::wfp, code, L"Wait for shared-infrastructure mutex"));
 }
 
 Result<std::uint16_t> parse_port(std::wstring_view text)
@@ -376,6 +467,71 @@ Result<std::vector<std::byte>> resolve_account_sid(std::wstring_view account)
     return sid;
 }
 
+Result<std::vector<std::byte>> current_user_sid()
+{
+    HANDLE token {};
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token))
+    {
+        return std::unexpected(
+            win32_error(ExitCode::precondition, GetLastError(), L"Open caller token"));
+    }
+    const auto close = [&] { CloseHandle(token); };
+    DWORD size {};
+    GetTokenInformation(token, TokenUser, nullptr, 0, &size);
+    const DWORD first_error = GetLastError();
+    if (first_error != ERROR_INSUFFICIENT_BUFFER || size == 0)
+    {
+        close();
+        return std::unexpected(
+            win32_error(ExitCode::precondition, first_error, L"Read caller token user"));
+    }
+    std::vector<std::byte> user(size);
+    if (!GetTokenInformation(token, TokenUser, user.data(), size, &size))
+    {
+        const DWORD code = GetLastError();
+        close();
+        return std::unexpected(
+            win32_error(ExitCode::precondition, code, L"Read caller token user"));
+    }
+    close();
+    const auto* token_user = reinterpret_cast<const TOKEN_USER*>(user.data());
+    if (!token_user->User.Sid || !IsValidSid(token_user->User.Sid))
+    {
+        return std::unexpected(error(ExitCode::precondition,
+            ERROR_INVALID_DATA,
+            L"Caller token contains an invalid user SID"));
+    }
+    const DWORD sid_size = GetLengthSid(token_user->User.Sid);
+    std::vector<std::byte> sid(sid_size);
+    std::memcpy(sid.data(), token_user->User.Sid, sid_size);
+    return sid;
+}
+
+Result<void> require_self_or_elevation(PSID target_sid)
+{
+    auto elevated = is_elevated();
+    if (!elevated)
+    {
+        return std::unexpected(elevated.error());
+    }
+    if (*elevated)
+    {
+        return {};
+    }
+    auto caller_sid = current_user_sid();
+    if (!caller_sid)
+    {
+        return std::unexpected(caller_sid.error());
+    }
+    if (!EqualSid(caller_sid->data(), target_sid))
+    {
+        return std::unexpected(error(ExitCode::precondition,
+            ERROR_ACCESS_DENIED,
+            L"A non-administrator may inspect only its own user-net-lock policy"));
+    }
+    return {};
+}
+
 Result<std::wstring> sid_string(PSID sid)
 {
     LPWSTR text {};
@@ -413,11 +569,21 @@ Result<std::vector<std::byte>> user_condition_descriptor(PSID sid)
     return result;
 }
 
-Result<std::vector<std::byte>> wfp_object_descriptor()
+Result<std::vector<std::byte>> wfp_object_descriptor(std::span<PSID const> read_users)
 {
+    std::wstring sddl(detail::administrative_wfp_object_dacl_sddl);
+    for (PSID user : read_users)
+    {
+        auto text = sid_string(user);
+        if (!text)
+        {
+            return std::unexpected(text.error());
+        }
+        sddl += L"(A;;GR;;;" + *text + L")";
+    }
     PSECURITY_DESCRIPTOR descriptor {};
     if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            detail::expected_wfp_object_dacl_sddl, SDDL_REVISION_1, &descriptor, nullptr))
+            sddl.c_str(), SDDL_REVISION_1, &descriptor, nullptr))
     {
         return std::unexpected(
             win32_error(ExitCode::wfp, GetLastError(), L"Build WFP object access control"));
@@ -524,7 +690,93 @@ std::wstring descriptor_dacl_sddl(PSECURITY_DESCRIPTOR descriptor)
     return text;
 }
 
-Result<void> verify_provider_access(HANDLE engine, const std::vector<std::byte>& expected)
+bool has_safe_shared_object_access(PSECURITY_DESCRIPTOR descriptor, PSID required_reader)
+{
+    if (!detail::has_protected_dacl(descriptor))
+    {
+        return false;
+    }
+    BOOL present {};
+    BOOL defaulted {};
+    PACL dacl {};
+    if (!GetSecurityDescriptorDacl(descriptor, &present, &dacl, &defaulted) || !present || !dacl)
+    {
+        return false;
+    }
+    SID_IDENTIFIER_AUTHORITY authority = SECURITY_NT_AUTHORITY;
+    PSID system {};
+    PSID administrators {};
+    const BOOL system_created = AllocateAndInitializeSid(
+        &authority, 1, SECURITY_LOCAL_SYSTEM_RID, 0, 0, 0, 0, 0, 0, 0, &system);
+    const BOOL administrators_created = AllocateAndInitializeSid(&authority,
+        2,
+        SECURITY_BUILTIN_DOMAIN_RID,
+        DOMAIN_ALIAS_RID_ADMINS,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        &administrators);
+    if (!system_created || !administrators_created)
+    {
+        if (system_created)
+        {
+            FreeSid(system);
+        }
+        if (administrators_created)
+        {
+            FreeSid(administrators);
+        }
+        return false;
+    }
+    bool system_found {};
+    bool administrators_found {};
+    bool reader_found {};
+    bool valid = true;
+    for (DWORD index = 0; valid && index < dacl->AceCount; ++index)
+    {
+        void* entry {};
+        if (!GetAce(dacl, index, &entry))
+        {
+            valid = false;
+            break;
+        }
+        const auto* ace = static_cast<const ACCESS_ALLOWED_ACE*>(entry);
+        if (ace->Header.AceType != ACCESS_ALLOWED_ACE_TYPE || ace->Header.AceFlags != 0)
+        {
+            valid = false;
+            break;
+        }
+        const PSID sid = const_cast<PSID>(static_cast<const void*>(&ace->SidStart));
+        const DWORD mask = detail::normalized_wfp_access_mask(ace->Mask);
+        if (EqualSid(sid, system))
+        {
+            valid = !system_found && mask == FWPM_GENERIC_ALL;
+            system_found = true;
+        }
+        else if (EqualSid(sid, administrators))
+        {
+            valid = !administrators_found && mask == FWPM_GENERIC_ALL;
+            administrators_found = true;
+        }
+        else
+        {
+            valid = mask == FWPM_GENERIC_READ;
+            if (EqualSid(sid, required_reader))
+            {
+                valid = valid && !reader_found;
+                reader_found = true;
+            }
+        }
+    }
+    FreeSid(system);
+    FreeSid(administrators);
+    return valid && system_found && administrators_found && reader_found;
+}
+
+Result<void> verify_provider_access(HANDLE engine, PSID required_reader)
 {
     PSECURITY_DESCRIPTOR actual {};
     const DWORD code = FwpmProviderGetSecurityInfoByKey0(engine,
@@ -540,8 +792,7 @@ Result<void> verify_provider_access(HANDLE engine, const std::vector<std::byte>&
         return std::unexpected(win32_error(
             ExitCode::verification, code, L"Read user-net-lock provider access control"));
     }
-    const bool matches = detail::same_wfp_object_access_control_descriptor(
-        actual, reinterpret_cast<PSECURITY_DESCRIPTOR>(const_cast<std::byte*>(expected.data())));
+    const bool matches = has_safe_shared_object_access(actual, required_reader);
     const std::wstring actual_sddl = matches ? L"" : descriptor_dacl_sddl(actual);
     FwpmFreeMemory0(reinterpret_cast<void**>(&actual));
     if (!matches)
@@ -553,7 +804,7 @@ Result<void> verify_provider_access(HANDLE engine, const std::vector<std::byte>&
     return {};
 }
 
-Result<void> verify_sublayer_access(HANDLE engine, const std::vector<std::byte>& expected)
+Result<void> verify_sublayer_access(HANDLE engine, PSID required_reader)
 {
     PSECURITY_DESCRIPTOR actual {};
     const DWORD code = FwpmSubLayerGetSecurityInfoByKey0(engine,
@@ -569,8 +820,7 @@ Result<void> verify_sublayer_access(HANDLE engine, const std::vector<std::byte>&
         return std::unexpected(win32_error(
             ExitCode::verification, code, L"Read user-net-lock sublayer access control"));
     }
-    const bool matches = detail::same_wfp_object_access_control_descriptor(
-        actual, reinterpret_cast<PSECURITY_DESCRIPTOR>(const_cast<std::byte*>(expected.data())));
+    const bool matches = has_safe_shared_object_access(actual, required_reader);
     FwpmFreeMemory0(reinterpret_cast<void**>(&actual));
     if (!matches)
     {
@@ -679,6 +929,264 @@ Result<void> enumerate_filters(
         }
     }
     close();
+    return {};
+}
+
+Result<std::vector<std::vector<std::byte>>> managed_policy_user_sids(HANDLE engine)
+{
+    std::vector<std::vector<std::byte>> users;
+    auto enumerated = enumerate_filters(engine,
+        [&](const FWPM_FILTER0& filter) -> Result<void>
+        {
+            if (!filter.providerKey || !IsEqualGUID(*filter.providerKey, provider_key) ||
+                !IsEqualGUID(filter.subLayerKey, sublayer_key) || !filter.providerData.data ||
+                filter.providerData.size < policy_tag.size() + sizeof(std::uint16_t) ||
+                std::memcmp(filter.providerData.data, policy_tag.data(), policy_tag.size()) != 0)
+            {
+                return {};
+            }
+            const auto* sid = filter.providerData.data + policy_tag.size();
+            const PSID policy_sid = const_cast<void*>(static_cast<const void*>(sid));
+            if (!IsValidSid(policy_sid))
+            {
+                return std::unexpected(error(ExitCode::wfp,
+                    ERROR_INVALID_DATA,
+                    L"user-net-lock filter contains an invalid managed-account SID"));
+            }
+            const DWORD sid_size = GetLengthSid(policy_sid);
+            if (filter.providerData.size != policy_tag.size() + sid_size + sizeof(std::uint16_t))
+            {
+                return std::unexpected(error(ExitCode::wfp,
+                    ERROR_INVALID_DATA,
+                    L"user-net-lock filter contains malformed policy identity data"));
+            }
+            const auto already_present = std::any_of(users.begin(),
+                users.end(),
+                [&](const std::vector<std::byte>& existing)
+                {
+                    return existing.size() == sid_size &&
+                           EqualSid(const_cast<void*>(static_cast<const void*>(existing.data())),
+                               policy_sid);
+                });
+            if (!already_present)
+            {
+                std::vector<std::byte> copy(sid_size);
+                std::memcpy(copy.data(), sid, sid_size);
+                users.push_back(std::move(copy));
+            }
+            return {};
+        });
+    if (!enumerated)
+    {
+        return std::unexpected(enumerated.error());
+    }
+    return users;
+}
+
+Result<std::vector<std::byte>> infrastructure_descriptor(
+    HANDLE engine, PSID additional_user = nullptr)
+{
+    auto users = managed_policy_user_sids(engine);
+    if (!users)
+    {
+        return std::unexpected(users.error());
+    }
+    const auto present =
+        additional_user &&
+        std::any_of(users->begin(),
+            users->end(),
+            [&](const std::vector<std::byte>& existing)
+            {
+                return EqualSid(
+                    const_cast<void*>(static_cast<const void*>(existing.data())), additional_user);
+            });
+    if (additional_user && !present)
+    {
+        const DWORD size = GetLengthSid(additional_user);
+        std::vector<std::byte> copy(size);
+        std::memcpy(copy.data(), additional_user, size);
+        users->push_back(std::move(copy));
+    }
+    std::vector<PSID> identities;
+    identities.reserve(users->size());
+    for (const auto& user : *users)
+    {
+        identities.push_back(const_cast<void*>(static_cast<const void*>(user.data())));
+    }
+    return wfp_object_descriptor(identities);
+}
+
+bool has_explicit_access_ace(PACL dacl, PSID sid, DWORD mask)
+{
+    for (DWORD index = 0; index < dacl->AceCount; ++index)
+    {
+        void* entry {};
+        if (!GetAce(dacl, index, &entry))
+        {
+            return false;
+        }
+        const auto* ace = static_cast<const ACCESS_ALLOWED_ACE*>(entry);
+        if (ace->Header.AceType != ACCESS_ALLOWED_ACE_TYPE || ace->Header.AceFlags != 0)
+        {
+            continue;
+        }
+        const PSID ace_sid = const_cast<PSID>(static_cast<const void*>(&ace->SidStart));
+        if (ace->Mask == mask && EqualSid(ace_sid, sid))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+Result<void> grant_filter_enumeration(HANDLE engine, PSID user)
+{
+    PSECURITY_DESCRIPTOR descriptor {};
+    const DWORD read = FwpmFilterGetSecurityInfoByKey0(engine,
+        nullptr,
+        DACL_SECURITY_INFORMATION,
+        nullptr,
+        nullptr,
+        nullptr,
+        nullptr,
+        &descriptor);
+    if (read != ERROR_SUCCESS)
+    {
+        return std::unexpected(
+            win32_error(ExitCode::wfp, read, L"Read WFP filter-container access control"));
+    }
+    BOOL present {};
+    BOOL defaulted {};
+    PACL existing {};
+    if (!GetSecurityDescriptorDacl(descriptor, &present, &existing, &defaulted) || !present ||
+        !existing)
+    {
+        FwpmFreeMemory0(reinterpret_cast<void**>(&descriptor));
+        return std::unexpected(
+            error(ExitCode::wfp, ERROR_INVALID_DATA, L"WFP filter container has no DACL"));
+    }
+    if (has_explicit_access_ace(existing, user, FWPM_ACTRL_ENUM))
+    {
+        FwpmFreeMemory0(reinterpret_cast<void**>(&descriptor));
+        return {};
+    }
+    const DWORD addition = sizeof(ACCESS_ALLOWED_ACE) - sizeof(DWORD) + GetLengthSid(user);
+    std::vector<std::byte> storage(existing->AclSize + addition);
+    auto* replacement = reinterpret_cast<PACL>(storage.data());
+    if (!InitializeAcl(replacement, static_cast<DWORD>(storage.size()), existing->AclRevision))
+    {
+        const DWORD code = GetLastError();
+        FwpmFreeMemory0(reinterpret_cast<void**>(&descriptor));
+        return std::unexpected(
+            win32_error(ExitCode::wfp, code, L"Create WFP filter-container DACL"));
+    }
+    for (DWORD index = 0; index < existing->AceCount; ++index)
+    {
+        void* entry {};
+        if (!GetAce(existing, index, &entry) || !AddAce(replacement,
+                                                    replacement->AclRevision,
+                                                    MAXDWORD,
+                                                    entry,
+                                                    static_cast<PACE_HEADER>(entry)->AceSize))
+        {
+            const DWORD code = GetLastError();
+            FwpmFreeMemory0(reinterpret_cast<void**>(&descriptor));
+            return std::unexpected(
+                win32_error(ExitCode::wfp, code, L"Copy WFP filter-container access control"));
+        }
+    }
+    if (!AddAccessAllowedAceEx(replacement, replacement->AclRevision, 0, FWPM_ACTRL_ENUM, user))
+    {
+        const DWORD code = GetLastError();
+        FwpmFreeMemory0(reinterpret_cast<void**>(&descriptor));
+        return std::unexpected(win32_error(ExitCode::wfp, code, L"Grant WFP filter enumeration"));
+    }
+    const DWORD write = FwpmFilterSetSecurityInfoByKey0(
+        engine, nullptr, DACL_SECURITY_INFORMATION, nullptr, nullptr, replacement, nullptr);
+    FwpmFreeMemory0(reinterpret_cast<void**>(&descriptor));
+    if (write != ERROR_SUCCESS)
+    {
+        return std::unexpected(win32_error(ExitCode::wfp, write, L"Grant WFP filter enumeration"));
+    }
+    return {};
+}
+
+Result<void> remove_filter_enumeration(HANDLE engine, PSID user)
+{
+    PSECURITY_DESCRIPTOR descriptor {};
+    const DWORD read = FwpmFilterGetSecurityInfoByKey0(engine,
+        nullptr,
+        DACL_SECURITY_INFORMATION,
+        nullptr,
+        nullptr,
+        nullptr,
+        nullptr,
+        &descriptor);
+    if (read != ERROR_SUCCESS)
+    {
+        return std::unexpected(
+            win32_error(ExitCode::wfp, read, L"Read WFP filter-container access control"));
+    }
+    BOOL present {};
+    BOOL defaulted {};
+    PACL existing {};
+    if (!GetSecurityDescriptorDacl(descriptor, &present, &existing, &defaulted) || !present ||
+        !existing)
+    {
+        FwpmFreeMemory0(reinterpret_cast<void**>(&descriptor));
+        return std::unexpected(
+            error(ExitCode::wfp, ERROR_INVALID_DATA, L"WFP filter container has no DACL"));
+    }
+    if (!has_explicit_access_ace(existing, user, FWPM_ACTRL_ENUM))
+    {
+        FwpmFreeMemory0(reinterpret_cast<void**>(&descriptor));
+        return {};
+    }
+    std::vector<std::byte> storage(existing->AclSize);
+    auto* replacement = reinterpret_cast<PACL>(storage.data());
+    if (!InitializeAcl(replacement, static_cast<DWORD>(storage.size()), existing->AclRevision))
+    {
+        const DWORD code = GetLastError();
+        FwpmFreeMemory0(reinterpret_cast<void**>(&descriptor));
+        return std::unexpected(
+            win32_error(ExitCode::wfp, code, L"Create WFP filter-container DACL"));
+    }
+    for (DWORD index = 0; index < existing->AceCount; ++index)
+    {
+        void* entry {};
+        if (!GetAce(existing, index, &entry))
+        {
+            const DWORD code = GetLastError();
+            FwpmFreeMemory0(reinterpret_cast<void**>(&descriptor));
+            return std::unexpected(
+                win32_error(ExitCode::wfp, code, L"Read WFP filter-container access control"));
+        }
+        const auto* ace = static_cast<const ACCESS_ALLOWED_ACE*>(entry);
+        const PSID ace_sid = const_cast<PSID>(static_cast<const void*>(&ace->SidStart));
+        if (ace->Header.AceType == ACCESS_ALLOWED_ACE_TYPE && ace->Header.AceFlags == 0 &&
+            ace->Mask == FWPM_ACTRL_ENUM && EqualSid(ace_sid, user))
+        {
+            continue;
+        }
+        if (!AddAce(replacement,
+                replacement->AclRevision,
+                MAXDWORD,
+                entry,
+                static_cast<PACE_HEADER>(entry)->AceSize))
+        {
+            const DWORD code = GetLastError();
+            FwpmFreeMemory0(reinterpret_cast<void**>(&descriptor));
+            return std::unexpected(
+                win32_error(ExitCode::wfp, code, L"Copy WFP filter-container access control"));
+        }
+    }
+    const DWORD write = FwpmFilterSetSecurityInfoByKey0(
+        engine, nullptr, DACL_SECURITY_INFORMATION, nullptr, nullptr, replacement, nullptr);
+    FwpmFreeMemory0(reinterpret_cast<void**>(&descriptor));
+    if (write != ERROR_SUCCESS)
+    {
+        return std::unexpected(win32_error(ExitCode::wfp, write, L"Remove WFP filter enumeration"));
+    }
     return {};
 }
 
@@ -915,7 +1423,7 @@ Result<void> delete_user_filters(HANDLE engine, const std::vector<UINT8>& identi
     return {};
 }
 
-Result<void> remove_unused_infrastructure(HANDLE engine)
+Result<bool> remove_unused_infrastructure(HANDLE engine)
 {
     bool referenced {};
     auto enumerated = enumerate_filters(engine,
@@ -931,7 +1439,7 @@ Result<void> remove_unused_infrastructure(HANDLE engine)
     }
     if (referenced)
     {
-        return {};
+        return true;
     }
     DWORD code = FwpmSubLayerDeleteByKey0(engine, &sublayer_key);
     if (code != ERROR_SUCCESS && code != FWP_E_SUBLAYER_NOT_FOUND)
@@ -945,11 +1453,16 @@ Result<void> remove_unused_infrastructure(HANDLE engine)
         return std::unexpected(
             win32_error(ExitCode::wfp, code, L"Remove unused user-net-lock provider"));
     }
-    return {};
+    return false;
 }
 
 Result<void> clear_user_policy(PSID sid)
 {
+    auto infrastructure_lock = lock_shared_infrastructure();
+    if (!infrastructure_lock)
+    {
+        return std::unexpected(infrastructure_lock.error());
+    }
     auto engine = open_engine();
     if (!engine)
     {
@@ -968,11 +1481,11 @@ Result<void> clear_user_policy(PSID sid)
         FwpmTransactionAbort0(engine->value);
         return std::unexpected(deleted.error());
     }
-    auto removed = remove_unused_infrastructure(engine->value);
-    if (!removed)
+    auto retained = remove_unused_infrastructure(engine->value);
+    if (!retained)
     {
         FwpmTransactionAbort0(engine->value);
-        return std::unexpected(removed.error());
+        return std::unexpected(retained.error());
     }
     const DWORD commit = FwpmTransactionCommit0(engine->value);
     if (commit != ERROR_SUCCESS)
@@ -980,6 +1493,24 @@ Result<void> clear_user_policy(PSID sid)
         FwpmTransactionAbort0(engine->value);
         return std::unexpected(
             win32_error(ExitCode::wfp, commit, L"Commit user-net-lock removal transaction"));
+    }
+    if (*retained)
+    {
+        auto descriptor = infrastructure_descriptor(engine->value);
+        if (!descriptor)
+        {
+            return std::unexpected(descriptor.error());
+        }
+        auto refreshed = ensure_infrastructure(engine->value, *descriptor);
+        if (!refreshed)
+        {
+            return std::unexpected(refreshed.error());
+        }
+    }
+    auto enumeration = remove_filter_enumeration(engine->value, sid);
+    if (!enumeration)
+    {
+        return std::unexpected(enumeration.error());
     }
     return {};
 }
@@ -1084,17 +1615,18 @@ Result<void> verify_loopback_policy(PSID sid, std::uint16_t port)
     {
         return std::unexpected(user_sd.error());
     }
-    auto object_sd = wfp_object_descriptor();
-    if (!object_sd)
+    const std::array<PSID, 1> read_users {sid};
+    auto filter_sd = wfp_object_descriptor(read_users);
+    if (!filter_sd)
     {
-        return std::unexpected(object_sd.error());
+        return std::unexpected(filter_sd.error());
     }
-    auto provider_access = verify_provider_access(engine->value, *object_sd);
+    auto provider_access = verify_provider_access(engine->value, sid);
     if (!provider_access)
     {
         return std::unexpected(provider_access.error());
     }
-    auto sublayer_access = verify_sublayer_access(engine->value, *object_sd);
+    auto sublayer_access = verify_sublayer_access(engine->value, sid);
     if (!sublayer_access)
     {
         return std::unexpected(sublayer_access.error());
@@ -1117,7 +1649,7 @@ Result<void> verify_loopback_policy(PSID sid, std::uint16_t port)
                 if (!matched[index] && matches_rule(filter, expected[index], data, *user_sd))
                 {
                     auto filter_access =
-                        verify_filter_access(engine->value, filter.filterKey, *object_sd);
+                        verify_filter_access(engine->value, filter.filterKey, *filter_sd);
                     if (!filter_access)
                     {
                         return std::unexpected(filter_access.error());
@@ -1147,6 +1679,11 @@ Result<void> verify_loopback_policy(PSID sid, std::uint16_t port)
 
 Result<void> apply_loopback_policy(PSID sid, std::uint16_t port)
 {
+    auto infrastructure_lock = lock_shared_infrastructure();
+    if (!infrastructure_lock)
+    {
+        return std::unexpected(infrastructure_lock.error());
+    }
     auto engine = open_engine();
     if (!engine)
     {
@@ -1157,12 +1694,18 @@ Result<void> apply_loopback_policy(PSID sid, std::uint16_t port)
     {
         return std::unexpected(user_sd.error());
     }
-    auto object_sd = wfp_object_descriptor();
-    if (!object_sd)
+    auto infrastructure_sd = infrastructure_descriptor(engine->value, sid);
+    if (!infrastructure_sd)
     {
-        return std::unexpected(object_sd.error());
+        return std::unexpected(infrastructure_sd.error());
     }
-    auto infrastructure = ensure_infrastructure(engine->value, *object_sd);
+    const std::array<PSID, 1> read_users {sid};
+    auto filter_sd = wfp_object_descriptor(read_users);
+    if (!filter_sd)
+    {
+        return std::unexpected(filter_sd.error());
+    }
+    auto infrastructure = ensure_infrastructure(engine->value, *infrastructure_sd);
     if (!infrastructure)
     {
         return std::unexpected(infrastructure.error());
@@ -1199,7 +1742,7 @@ Result<void> apply_loopback_policy(PSID sid, std::uint16_t port)
             rule,
             user_blob,
             data,
-            static_cast<PSECURITY_DESCRIPTOR>(object_sd->data()));
+            static_cast<PSECURITY_DESCRIPTOR>(filter_sd->data()));
         if (!added)
         {
             abort();
@@ -1214,6 +1757,11 @@ Result<void> apply_loopback_policy(PSID sid, std::uint16_t port)
             win32_error(ExitCode::wfp, commit, L"Commit user-net-lock transaction"));
     }
     active = false;
+    auto enumeration = grant_filter_enumeration(engine->value, sid);
+    if (!enumeration)
+    {
+        return std::unexpected(enumeration.error());
+    }
     return {};
 }
 
@@ -1285,15 +1833,15 @@ Result<void> apply_command(std::wstring_view user, std::uint16_t port)
 
 Result<void> verify_command(std::wstring_view user, std::uint16_t port)
 {
-    auto elevated = require_elevation();
-    if (!elevated)
-    {
-        return std::unexpected(elevated.error());
-    }
     auto sid = resolve_account_sid(user);
     if (!sid)
     {
         return std::unexpected(sid.error());
+    }
+    auto authorized = require_self_or_elevation(sid->data());
+    if (!authorized)
+    {
+        return std::unexpected(authorized.error());
     }
     return verify_loopback_policy(sid->data(), port);
 }
@@ -1315,15 +1863,15 @@ Result<void> remove_command(std::wstring_view user)
 
 Result<void> list_command(std::wstring_view user)
 {
-    auto elevated = require_elevation();
-    if (!elevated)
-    {
-        return std::unexpected(elevated.error());
-    }
     auto sid = resolve_account_sid(user);
     if (!sid)
     {
         return std::unexpected(sid.error());
+    }
+    auto authorized = require_self_or_elevation(sid->data());
+    if (!authorized)
+    {
+        return std::unexpected(authorized.error());
     }
     auto text = sid_string(sid->data());
     if (!text)
@@ -1407,7 +1955,8 @@ void print_usage()
                << L"\nOptions:\n"
                << L"  --user <account>  Local Windows account to which the policy applies.\n"
                << L"  --port <port>     Loopback TCP port, from 1 through 65535.\n"
-               << L"\nAll commands require an elevated Administrator session.\n"
+               << L"\napply and remove require an elevated Administrator session. "
+                  L"A managed standard account may list or verify only its own policy.\n"
                << std::endl;
 }
 

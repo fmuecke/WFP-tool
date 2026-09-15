@@ -77,13 +77,15 @@ PSECURITY_DESCRIPTOR descriptor_from_sddl(PCWSTR sddl)
 
 void wfp_object_access_control_tests()
 {
-    // Keep the test's independent expected value in sync with the administrative
-    // policy contract: P prevents inherited WFP engine ACEs from widening it.
+    // P prevents inherited WFP engine ACEs from widening the administrative
+    // baseline. A managed account receives a separate, read-only ACE.
     constexpr wchar_t expected_sddl[] = L"D:P(A;;GA;;;SY)(A;;GA;;;BA)";
-    check(std::wcscmp(user_net_lock::detail::expected_wfp_object_dacl_sddl, expected_sddl) == 0,
-        "WFP objects grant full control only to SYSTEM and Administrators");
+    check(
+        std::wcscmp(user_net_lock::detail::administrative_wfp_object_dacl_sddl, expected_sddl) == 0,
+        "WFP objects retain SYSTEM and Administrators full control baseline");
 
-    PSECURITY_DESCRIPTOR expected = descriptor_from_sddl(expected_sddl);
+    PSECURITY_DESCRIPTOR expected =
+        descriptor_from_sddl(L"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GR;;;AU)");
     std::unique_ptr<void, decltype(&LocalFree)> expected_memory(expected, LocalFree);
     if (!expected)
     {
@@ -91,17 +93,29 @@ void wfp_object_access_control_tests()
     }
     check(user_net_lock::detail::same_access_control_descriptor(expected, expected),
         "the expected WFP object DACL matches itself");
+    check(user_net_lock::detail::has_protected_dacl(expected),
+        "the expected WFP object DACL is protected");
 
-    // This intentionally grants Everyone read access and must not match the
-    // administrative-only descriptor above.
-    PSECURITY_DESCRIPTOR broader = descriptor_from_sddl(L"D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GR;;;WD)");
+    PSECURITY_DESCRIPTOR unprotected =
+        descriptor_from_sddl(L"D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GR;;;AU)");
+    std::unique_ptr<void, decltype(&LocalFree)> unprotected_memory(unprotected, LocalFree);
+    if (!unprotected)
+    {
+        return;
+    }
+    check(!user_net_lock::detail::has_protected_dacl(unprotected),
+        "an unprotected WFP object DACL is rejected");
+
+    // A managed account may read status, but no standard account may receive
+    // WFP write, delete, or DACL-changing rights.
+    PSECURITY_DESCRIPTOR broader = descriptor_from_sddl(L"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GW;;;AU)");
     std::unique_ptr<void, decltype(&LocalFree)> broader_memory(broader, LocalFree);
     if (!broader)
     {
         return;
     }
     check(!user_net_lock::detail::same_access_control_descriptor(broader, expected),
-        "a WFP object DACL that grants Everyone access is rejected");
+        "a WFP object DACL that grants a managed account write access is rejected");
 }
 
 } // namespace
